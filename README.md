@@ -14,13 +14,13 @@
   - Includes a `/edge/v4/upload` `fetch` guard so streaming uploads never fall back into the 64 KiB slicing loop.
 
 - **Progress UI Update Throttling**:
-  - Throttles `/edge/v4/upload` `XMLHttpRequest.upload.onprogress` callbacks to `200ms` intervals while always forwarding final completion bytes immediately, cutting Svelte reactive DOM updates dramatically without affecting transferred byte accuracy.
+  - Throttles `/edge/v4/upload` `XMLHttpRequest.upload.onprogress` callbacks to `500ms` intervals (matching `kio.ac`'s internal 500ms speed meter) while always forwarding final completion bytes immediately, cutting Svelte reactive DOM updates without affecting transferred byte accuracy.
 
 - **0ms Busy-Wait Loop Elimination**:
-  - Replaces the experimental streaming uploader's zero-delay `scheduler.postTask(() => {}, { priority: "user-visible" })` spin loop with a `25ms` yield, keeping idle waiting near 0% CPU while leaving active chunk queueing responsive.
+  - Replaces the experimental streaming uploader's zero-delay `scheduler.postTask(() => {}, { priority: "user-visible" })` spin loop with a `50ms` foreground / `250ms` background yield, keeping idle waiting near 0% CPU while leaving active chunk queueing responsive.
 
 - **Realtime Chart Frame-Rate Capping**:
-  - Caps the `/upload` page `chartjs-plugin-streaming` `requestAnimationFrame` loop to `2fps` (`500ms`) in the foreground and lets the browser suspend it via native `rAF` when the tab is hidden, with full `cancelAnimationFrame` cleanup support.
+  - Caps the `/upload` page `chartjs-plugin-streaming` `requestAnimationFrame` loop to `1fps` (`1000ms`, matching the chart's 1-second data refresh) in the foreground and lets the browser suspend it via native `rAF` when the tab is hidden, with full `cancelAnimationFrame` cleanup support.
 
 ---
 
@@ -54,9 +54,9 @@ Configure these options at [`https://kio.ac/settings`](https://kio.ac/settings) 
 | Bottleneck | Original Behavior | Optimization |
 | :--- | :--- | :--- |
 | **64 KiB Stream Slicing** | `ReadableStream` copies 16 MiB chunks in 256 × 64 KiB `arrayBuffer()` slices | `Request.prototype.duplex` disabled → native `XMLHttpRequest` `Blob` upload |
-| **Progress Reactivity Spam** | UI state updated per 64 KiB slice (hundreds–thousands/sec) | `/edge/v4/upload` `onprogress` throttled to `200ms` |
-| **Streaming Loop Spin** | `scheduler.postTask(() => {}, { priority: "user-visible" })` 0ms loop | Empty yield tasks paced to `25ms` |
-| **Realtime Speed Graph** | `requestAnimationFrame` wakes every vsync, redraws canvas at `30fps` | `nextRefresh`/`frameRequestID` loop capped to `2fps` (0fps in background) |
+| **Progress Reactivity Spam** | UI state updated per 64 KiB slice (hundreds–thousands/sec) | `/edge/v4/upload` `onprogress` throttled to `500ms` |
+| **Streaming Loop Spin** | `scheduler.postTask(() => {}, { priority: "user-visible" })` 0ms loop | Empty yield tasks paced to `50ms` (`250ms` in background) |
+| **Realtime Speed Graph** | `requestAnimationFrame` wakes every vsync, redraws canvas at `30fps` | `nextRefresh`/`frameRequestID` loop capped to `1fps` (0fps in background) |
 
 Note: `kio.ac` requires per-chunk `SHA-256` hashes for server-side verification, so disk reads and hardware-accelerated WebCrypto hashing remain active at network upload speed.
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.1.0
+// @version      2.2.0
 // @description  Eliminates upload CPU spikes on kio.ac by forcing native XHR transfers, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -59,7 +59,7 @@
     };
   }
 
-  // 2) Throttle /edge/v4/upload XHR upload progress events to reduce Svelte UI re-renders
+  // 2) Throttle /edge/v4/upload XHR upload progress events to 500ms (matching kio.ac's 500ms speed meter)
   if (typeof XMLHttpRequest !== 'undefined') {
     try {
       const throttledUploads = new WeakSet();
@@ -103,7 +103,7 @@
             let lastRun = 0;
             const throttled = function (ev) {
               const now = performance.now();
-              if (now - lastRun >= 200 || (ev && ev.lengthComputable && ev.loaded >= ev.total)) {
+              if (now - lastRun >= 500 || (ev && ev.lengthComputable && ev.loaded >= ev.total)) {
                 lastRun = now;
                 return fn.call(this, ev);
               }
@@ -116,11 +116,10 @@
     } catch {}
   }
 
-  // 3) Replace 0ms scheduler.postTask busy-wait yields in the streaming uploader
+  // 3) Replace 0ms scheduler.postTask busy-wait yields in the streaming uploader (50ms fg / 250ms bg)
   const sched = window.scheduler;
   if (sched && typeof sched.postTask === 'function') {
     const origPostTask = sched.postTask.bind(sched);
-    const DELAY_MS = 25;
 
     sched.postTask = function (callback, options) {
       if (
@@ -129,15 +128,16 @@
         typeof callback === 'function' &&
         callback.toString().replace(/\s+/g, '') === '()=>{}'
       ) {
+        const delayMs = document.hidden ? 250 : 50;
         return new Promise((resolve) => {
-          setTimeout(() => resolve(callback()), DELAY_MS);
+          setTimeout(() => resolve(callback()), delayMs);
         });
       }
       return origPostTask(callback, options);
     };
   }
 
-  // 4) Cap chartjs-plugin-streaming rAF redraws on /upload to 2fps (pause in background tabs)
+  // 4) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)
   const origRAF = window.requestAnimationFrame?.bind(window);
   const origCancelRAF = window.cancelAnimationFrame?.bind(window);
   if (origRAF && origCancelRAF) {
@@ -155,7 +155,7 @@
           const tid = setTimeout(() => {
             chartTimers.delete(id);
             callback(performance.now());
-          }, 500);
+          }, 1000);
           chartTimers.set(id, tid);
           return id;
         }
@@ -173,3 +173,4 @@
     };
   }
 })();
+
