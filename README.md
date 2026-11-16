@@ -9,7 +9,11 @@
 
 ## Key Features
 
-- **Native `XMLHttpRequest` Direct Blob Uploads**:
+- **Single-Read Chunk Reuse (No Duplicate Disk/Blob I/O)**:
+  - Normally `kio.ac` reads every 16 MiB chunk twice through Chrome's Browser process (`Blob` IPC): once to compute `SHA-256` inside `streaming-worker`, and a second time when uploading the `Blob`.
+  - Transfers the already-hashed `ArrayBuffer` back from `streaming-worker` (zero-copy) and feeds it directly to `XMLHttpRequest.send(Uint8Array)` (bounded LRU cache, max 10 chunks), cutting Chrome Browser process Blob I/O in half with automatic fallback to normal `Blob` reads.
+
+- **Native `XMLHttpRequest` Direct Transfers**:
   - Disables the `fetch` `duplex: "half"` capability probe so `kio.ac` automatically uses its built-in `XMLHttpRequest` fallback instead of slicing every 16 MiB chunk into 256 × 64 KiB `ReadableStream` `arrayBuffer()` reads in JavaScript.
   - Includes a `/edge/v4/upload` `fetch` guard so streaming uploads never fall back into the 64 KiB slicing loop.
 
@@ -53,12 +57,13 @@ Configure these options at [`https://kio.ac/settings`](https://kio.ac/settings) 
 
 | Bottleneck | Original Behavior | Optimization |
 | :--- | :--- | :--- |
-| **64 KiB Stream Slicing** | `ReadableStream` copies 16 MiB chunks in 256 × 64 KiB `arrayBuffer()` slices | `Request.prototype.duplex` disabled → native `XMLHttpRequest` `Blob` upload |
+| **Duplicate File/Blob Reads** | Reads each 16 MiB chunk twice via Browser `MojoBlobReader` (hash + upload) | Zero-copy recycles hashed `ArrayBuffer` into `XHR.send(Uint8Array)` (10-chunk LRU) |
+| **64 KiB Stream Slicing** | `ReadableStream` copies 16 MiB chunks in 256 × 64 KiB `arrayBuffer()` slices | `Request.prototype.duplex` disabled → native `XMLHttpRequest` upload |
 | **Progress Reactivity Spam** | UI state updated per 64 KiB slice (hundreds–thousands/sec) | `/edge/v4/upload` `onprogress` throttled to `500ms` |
 | **Streaming Loop Spin** | `scheduler.postTask(() => {}, { priority: "user-visible" })` 0ms loop | Empty yield tasks paced to `50ms` (`250ms` in background) |
 | **Realtime Speed Graph** | `requestAnimationFrame` wakes every vsync, redraws canvas at `30fps` | `nextRefresh`/`frameRequestID` loop capped to `1fps` (0fps in background) |
 
-Note: `kio.ac` requires per-chunk `SHA-256` hashes for server-side verification, so disk reads and hardware-accelerated WebCrypto hashing remain active at network upload speed.
+Note: `kio.ac` requires per-chunk `SHA-256` hashes and HTTPS (TLS) transmission, so a single disk read, WebCrypto hashing, and `NetworkService` TLS encryption remain active at network upload speed.
 
 ---
 
