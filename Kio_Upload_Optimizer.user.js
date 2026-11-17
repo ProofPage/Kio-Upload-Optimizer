@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.6.4
+// @version      2.7.0
 // @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -26,21 +26,25 @@
   const SLICE_BYTES = 16 * 1024 * 1024;
   // Change these two numbers to tune behaviour; no console command or settings page needed
   const LIMIT_MBPS = 110; // upload cap in Mbps (0 = no cap)
-  const UNLIMITED_IN_BACKGROUND = true; // full speed while the tab is hidden
-  const limit = { mbps: LIMIT_MBPS, windowMs: 250, windowStart: 0, windowBytes: 0 };
-  // Chrome throttles hidden-tab timers to 1s, so a background tab uses 4x wider windows
-  const pacingWindowMs = () => (document.hidden ? limit.windowMs * 4 : limit.windowMs);
+  const UNLIMITED_IN_BACKGROUND = true; // session limit only; a chunk already sent keeps its own rate
+  // Windows are short so a single chunk still spreads over many of them (a 16 MiB chunk = ~466 Mbps in one 250ms window)
+  const limit = { mbps: LIMIT_MBPS, windowMs: 50, windowStart: 0, windowBytes: 0 };
+  // A background tab gets 1s timers and no frame budget, so its byte windows are longer, not its bytes faster
+  const pacingWindowMs = () => (document.hidden ? 1000 : limit.windowMs);
 
+  // A hidden tab calmly paced would spend minutes on one chunk, so the whole session keeps the speed it started with
+  const sessionUnlimited = UNLIMITED_IN_BACKGROUND && document.hidden;
+
+  // Read per call, and only before a byte window has started: a window that already latched cannot be refunded
   function isPacingActive() {
-    return limit.mbps > 0 && !(UNLIMITED_IN_BACKGROUND && document.hidden);
+    return !sessionUnlimited && limit.mbps > 0;
   }
 
   // Small status chip: shows the hardcoded cap and background mode, no DevTools needed
   function showModeChip() {
     const chip = document.createElement('div');
-    chip.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${
-      UNLIMITED_IN_BACKGROUND ? ' · bg unlimited' : ''
-    }`;
+    const suffix = UNLIMITED_IN_BACKGROUND ? ' \u00B7 bg unlimited' : '';
+    chip.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${suffix}`;
     chip.style.cssText =
       'position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:4px 8px;border-radius:6px;' +
       'background:rgba(17,17,17,.85);color:#fff;font:12px/1.4 system-ui,sans-serif;pointer-events:none;opacity:.8';
@@ -54,36 +58,39 @@
   }
 
   // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped XHR
-  const diag = { version: 'v2.6.4', chunks: 0, paced: 0, unlimited: 0, hiddenUnlimited: 0 };
-  window.__kioUploadOptimizer = { version: diag.version, limit, diag, isPacingActive };
+  const diag = { version: 'v2.7.0', chunks: 0, paced: 0, unlimited: 0, hiddenUnlimited: sessionUnlimited ? 1 : 0, queuedPeak: 0 };
+  window.__kioUploadOptimizer = { version: diag.version, limit, diag, isPacingActive, sessionUnlimited };
 
   // One shared queue paced by the window budget, so chunks never exceed the cap and never go out of order
   const sliceQueue = [];
 
   function drainSliceQueue() {
+    const send = sliceQueue.shift();
+    if (!send) return;
     const now = performance.now();
     const windowMs = pacingWindowMs();
     if (!limit.windowStart || now - limit.windowStart >= windowMs) {
       limit.windowStart = now;
       limit.windowBytes = 0;
     }
-
-    const budget = ((limit.mbps * 1024 * 1024) / 8) * (windowMs / 1000);
-    while (sliceQueue.length && limit.windowBytes + SLICE_BYTES <= budget) {
-      limit.windowBytes += SLICE_BYTES;
-      sliceQueue.shift()();
-    }
-
+    // A whole chunk is the smallest unit: release it, then wait until enough budget has accrued to start the next one
+    limit.windowBytes += SLICE_BYTES;
+    send();
     if (sliceQueue.length) {
-      setTimeout(drainSliceQueue, Math.max(1, windowMs - (now - limit.windowStart)));
+      const elapsed = performance.now() - limit.windowStart;
+      const overBudget = (limit.windowBytes - budget()) / bytesPerMs();
+      setTimeout(drainSliceQueue, Math.max(1, Math.round(windowMs - elapsed + Math.max(0, overBudget))));
     }
   }
 
+  const bytesPerMs = () => (limit.mbps * 1024 * 1024) / 8 / 1000;
+  const budget = () => ((limit.mbps * 1024 * 1024) / 8) * (pacingWindowMs() / 1000);
+
   function paceSlice(sendSlice) {
     diag.chunks += 1;
-    if (!isPacingActive()) {
+    // Not paced: either the session runs unlimited or no byte window has started yet
+    if (sessionUnlimited || !limit.windowStart) {
       diag.unlimited += 1;
-      if (document.hidden) diag.hiddenUnlimited += 1;
       sendSlice();
       return;
     }
@@ -469,7 +476,7 @@
     );
 
     const askTick = () => {
-      if (isPacingActive() && document.hidden) bgWorker.postMessage(limit.windowMs);
+      if (isPacingActive() && document.hidden) bgWorker.postMessage(250);
     };
 
     bgWorker.onmessage = () => {
