@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.6.3
+// @version      2.6.4
 // @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -53,6 +53,10 @@
     showModeChip();
   }
 
+  // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped XHR
+  const diag = { version: 'v2.6.4', chunks: 0, paced: 0, unlimited: 0, hiddenUnlimited: 0 };
+  window.__kioUploadOptimizer = { version: diag.version, limit, diag, isPacingActive };
+
   // One shared queue paced by the window budget, so chunks never exceed the cap and never go out of order
   const sliceQueue = [];
 
@@ -76,10 +80,14 @@
   }
 
   function paceSlice(sendSlice) {
+    diag.chunks += 1;
     if (!isPacingActive()) {
+      diag.unlimited += 1;
+      if (document.hidden) diag.hiddenUnlimited += 1;
       sendSlice();
       return;
     }
+    diag.paced += 1;
     sliceQueue.push(sendSlice);
     if (sliceQueue.length === 1) drainSliceQueue();
   }
@@ -470,8 +478,7 @@
     document.addEventListener('visibilitychange', askTick);
   } catch {}
 
-  // 5) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)
-  const origRAF = window.requestAnimationFrame?.bind(window);
+  // 5) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)  const origRAF = window.requestAnimationFrame?.bind(window);
   const origCancelRAF = window.cancelAnimationFrame?.bind(window);
   if (origRAF && origCancelRAF) {
     const chartTimers = new Map();
