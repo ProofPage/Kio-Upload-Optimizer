@@ -20,6 +20,7 @@
     - `kioUploadSpeed(0)` — disable cap (unlimited)
     - `kioBackground(true)` — lift the cap while the tab is hidden (`false` keeps the cap everywhere)
   - While the cap is active, each `/edge/v4/upload` `ReadableStream` is paced in `256 KiB` batches through a single shared byte-budget queue (~19 ms per batch across all upload threads), keeping real-time speed steady at ~110 Mbps without 16 MiB network bursts.
+  - Deduplication-skipped chunks (`exists: true`) also share the same byte-budget queue (capped at a 45 s safety deadline under `kio.ac`'s 60 s chunk timeout), keeping local `SHA-256` hashing CPU, disk reads, and the UI speed meter within the configured `Mbps` limit.
   - When unlimited (`kioUploadSpeed(0)` or background tab with `kioBackground(true)`), `fetch` `duplex: "half"` is rejected so `kio.ac` falls back to single-`PUT` native `XMLHttpRequest` for lowest CPU usage.
 
 - **Background Upload Support**:
@@ -43,7 +44,7 @@
    - [Violentmonkey](https://violentmonkey.github.io/) (Recommended)
    - [Tampermonkey](https://www.tampermonkey.net/)
 2. Open the userscript installation URL:
-   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@99894451631f3703774b9f2db816ce7656faafd1/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
+   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@3a1d51d30635eb2df9f20cc68aa9e03100c0cf1e/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload. The cap (110 Mbps) and background mode are already on.
    - Updating from an older version? Reload the `/upload` tab and restart the upload. Uploads already running keep the old speed, because `kio.ac` builds its uploader once per page load.
