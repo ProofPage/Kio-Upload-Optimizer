@@ -17,9 +17,13 @@
   - Disables the `fetch` `duplex: "half"` capability probe so `kio.ac` automatically uses its built-in `XMLHttpRequest` fallback instead of slicing every 16 MiB chunk into 256 × 64 KiB `ReadableStream` `arrayBuffer()` reads in JavaScript.
   - Includes a `/edge/v4/upload` `fetch` guard so streaming uploads never fall back into the 64 KiB slicing loop.
 
-- **Upload Speed Cap (Mbps)**:
-  - Opens `https://kio.ac/upload`, then run `kioUploadSpeed(80)` in the DevTools console to hold the whole account upload near **80 Mbps** (1–2000 Mbps, or `kioUploadSpeed(0)` to remove the cap). The value is saved in extension storage and re-applied automatically.
+- **Upload Speed Cap (110 Mbps by default)**:
+  - Ships with the cap on at **110 Mbps**; run `kioUploadSpeed(80)` in the DevTools console on `https://kio.ac/upload` to change it (1–2000 Mbps, `kioUploadSpeed(0)` removes the cap). The value is saved in extension storage and re-applied automatically.
   - Chunks are released from a single shared queue, so concurrent upload threads cannot exceed the cap together and chunks are never sent out of order. Each chunk still travels as one `PUT`, so server-side hash checks and retries keep working.
+
+- **Background Upload Support**:
+  - Chrome clamps hidden-tab timers to 1 second and suspends `requestAnimationFrame`, which stalls the chunk queue once the tab is hidden. The queue is now driven by a tiny dedicated Worker that keeps its own timer budget, so uploads continue while you work in another tab.
+  - The cap still applies in the background. Run `kioBackground(true)` to skip the cap while the tab is hidden (full speed), and `kioBackground(false)` (default) to keep the Mbps limit everywhere.
 
 - **Progress UI Update Throttling**:
   - Throttles `/edge/v4/upload` `XMLHttpRequest.upload.onprogress` callbacks to `500ms` intervals (matching `kio.ac`'s internal 500ms speed meter) while always forwarding final completion bytes immediately, cutting Svelte reactive DOM updates without affecting transferred byte accuracy.
@@ -41,7 +45,7 @@
    - Click to install [`Kio_Upload_Optimizer.user.js`](https://raw.githubusercontent.com/ProofPage/Kio-Upload-Optimizer/main/Kio_Upload_Optimizer.user.js).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload.
-5. Optional speed cap: open the DevTools console on `https://kio.ac/upload` and run `kioUploadSpeed(80)` for ~80 Mbps (`kioUploadSpeed(0)` removes the cap).
+5. Speed cap is on at **110 Mbps** by default. Change it in the DevTools console on `https://kio.ac/upload` with `kioUploadSpeed(80)` (`kioUploadSpeed(0)` removes the cap), and use `kioBackground(true)` to lift the cap while the tab is in the background.
 
 For Tampermonkey 5.3+ in Chrome-based browsers, enable **Allow User Scripts** in the extension settings (Chrome 138+) or enable **Developer Mode**. See the [official permission instructions](https://www.tampermonkey.net/faq.php?q=Q209).
 
@@ -63,7 +67,8 @@ Configure these options at [`https://kio.ac/settings`](https://kio.ac/settings) 
 | Bottleneck | Original Behavior | Optimization |
 | :--- | :--- | :--- |
 | **Duplicate File/Blob Reads** | Reads each 16 MiB chunk twice via Browser `MojoBlobReader` (hash + upload) | Zero-copy recycles hashed `ArrayBuffer` into `XHR.send(Uint8Array)` (10-chunk LRU) |
-| **Speed Spikes (100–150 Mbps)** | All upload threads send full speed with no shared budget | One 16 MiB-chunk queue paced by a `250ms` byte window (`kioUploadSpeed`) |
+| **Speed Spikes (100–150 Mbps)** | All upload threads send full speed with no shared budget | One 16 MiB-chunk queue paced by a `250ms` byte window, on by default at `110` Mbps |
+| **Hidden-Tab Stalls** | Chrome clamps hidden timers to 1s, so queueing stops when the tab is backgrounded | Queue released by a dedicated Worker timer, cap preserved in the background |
 | **64 KiB Stream Slicing** | `ReadableStream` copies 16 MiB chunks in 256 × 64 KiB `arrayBuffer()` slices | `Request.prototype.duplex` disabled → native `XMLHttpRequest` upload |
 | **Progress Reactivity Spam** | UI state updated per 64 KiB slice (hundreds–thousands/sec) | `/edge/v4/upload` `onprogress` throttled to `500ms` |
 | **Streaming Loop Spin** | `scheduler.postTask(() => {}, { priority: "user-visible" })` 0ms loop | Empty yield tasks paced to `50ms` (`250ms` in background) |

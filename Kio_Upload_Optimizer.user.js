@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.4.0
+// @version      2.5.0
 // @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -23,7 +23,8 @@
 
   // Bandwidth cap: whole chunks are released from one shared queue under a fixed byte window (Mbps, 0 = unlimited)
   const SLICE_BYTES = 16 * 1024 * 1024;
-  const limit = { mbps: 0, windowMs: 250, windowStart: 0, windowBytes: 0 };
+  const DEFAULT_MBPS = 110;
+  const limit = { mbps: DEFAULT_MBPS, windowMs: 250, windowStart: 0, windowBytes: 0 };
   const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // Chrome throttles hidden-tab timers to 1s, so a background tab uses 4x wider windows
   const pacingWindowMs = () => (document.hidden ? limit.windowMs * 4 : limit.windowMs);
@@ -34,7 +35,10 @@
   }
 
   try {
-    chrome.storage.local.get('kio_upload_mbps', (res) => applyMbps(res?.kio_upload_mbps));
+    chrome.storage.local.get('kio_upload_mbps', (res) => {
+      if (res && 'kio_upload_mbps' in res) applyMbps(res.kio_upload_mbps);
+      else applyMbps(DEFAULT_MBPS);
+    });
   } catch {}
 
   // Console helper: `kioUploadSpeed(80)` caps the upload at 80 Mbps, `kioUploadSpeed(0)` removes the cap
@@ -44,6 +48,27 @@
       chrome.storage.local.set({ kio_upload_mbps: limit.mbps });
     } catch {}
     return limit.mbps;
+  };
+
+  // Background upload mode: skips the queue so a hidden tab is not slowed by Chrome's 1s timer throttle
+  const hiddenMode = { enabled: false };
+  try {
+    chrome.storage.local.get('kio_bg_unrestricted', (res) => {
+      if (res && typeof res.kio_bg_unrestricted === 'boolean') hiddenMode.enabled = res.kio_bg_unrestricted;
+    });
+  } catch {}
+
+  function isPacingActive() {
+    return limit.mbps > 0 && !(hiddenMode.enabled && document.hidden);
+  }
+
+  // Console helper: `kioBackground(true)` uploads at full speed while the tab is hidden
+  win.kioBackground = function (enabled) {
+    hiddenMode.enabled = Boolean(enabled);
+    try {
+      chrome.storage.local.set({ kio_bg_unrestricted: hiddenMode.enabled });
+    } catch {}
+    return hiddenMode.enabled;
   };
 
   // One shared queue paced by the window budget, so chunks never exceed the cap and never go out of order
@@ -69,7 +94,7 @@
   }
 
   function paceSlice(sendSlice) {
-    if (limit.mbps <= 0) {
+    if (!isPacingActive()) {
       sendSlice();
       return;
     }
@@ -423,6 +448,7 @@
   }
 
   // 4) Replace 0ms scheduler.postTask busy-wait yields in the streaming uploader (50ms fg / 250ms bg)
+  // A hidden tab gets a native Worker tick instead of setTimeout, since Chrome clamps hidden timers to 1s
   const sched = window.scheduler;
   if (sched && typeof sched.postTask === 'function') {
     const origPostTask = sched.postTask.bind(sched);
@@ -442,6 +468,25 @@
       return origPostTask(callback, options);
     };
   }
+
+  // A tiny Worker keeps its own timer budget, so it can release queued chunks while the tab is hidden.
+  try {
+    const bgWorker = new Worker(
+      URL.createObjectURL(
+        new Blob(['self.onmessage=e=>setTimeout(()=>self.postMessage(1),e.data);'], { type: 'text/javascript' }),
+      ),
+    );
+
+    const askTick = () => {
+      if (isPacingActive() && document.hidden) bgWorker.postMessage(limit.windowMs);
+    };
+
+    bgWorker.onmessage = () => {
+      drainSliceQueue();
+      askTick();
+    };
+    document.addEventListener('visibilitychange', askTick);
+  } catch {}
 
   // 5) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)
   const origRAF = window.requestAnimationFrame?.bind(window);
