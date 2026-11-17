@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      3.2.0
-// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly pacing upload and dedup-hash Mbps via kioUploadSpeed(mbps), throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
+// @version      3.3.0
+// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly pacing upload and dedup-hash speeds via kioUploadSpeed(mbps | '95MB'), throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -23,18 +23,30 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const SLICE_BYTES = 16 * 1024 * 1024;
-  const STREAM_BATCH_BYTES = 256 * 1024;
+  const MIN_STREAM_BATCH_BYTES = 256 * 1024;
+  const MAX_STREAM_BATCH_BYTES = 4 * 1024 * 1024;
   const DEFAULT_MBPS = 110; // default upload cap in Mbps (0 = no cap)
   const STORAGE_MBPS_KEY = 'kio_upload_mbps';
   const STORAGE_BG_KEY = 'kio_bg_unrestricted';
   const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-  const limit = { mbps: DEFAULT_MBPS, nextSendAt: 0 };
+  const limit = { mbps: DEFAULT_MBPS, nextSendAt: 0, nextDedupAt: 0 };
   const hiddenMode = { enabled: false }; // stay capped even when occluded or in another tab unless kioBackground(true)
 
-  function normalizeMbps(mbps) {
+  function normalizeMbps(mbps, unit) {
+    if (typeof mbps === 'string') {
+      const m = mbps.trim().match(/^(\d+(?:\.\d+)?)\s*(mib|mb|m)?(?:\/s|ps)?$/i);
+      if (!m) return 0;
+      const num = Number(m[1]);
+      const u = (unit || m[2] || '').toLowerCase();
+      const scaled = u === 'mib' || u === 'mb' ? (num * 1024 * 1024 * 8) / 1e6 : num;
+      return Number.isFinite(scaled) && scaled > 0 ? Math.min(Math.round(scaled), 5000) : 0;
+    }
     const value = Number(mbps);
-    return Number.isFinite(value) && value > 0 ? Math.min(value, 2000) : 0;
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    const u = typeof unit === 'string' ? unit.trim().toLowerCase() : '';
+    const scaled = u === 'mib' || u === 'mb' || u === 'mb/s' || u === 'mib/s' ? (value * 1024 * 1024 * 8) / 1e6 : value;
+    return Math.min(Math.round(scaled), 5000);
   }
 
   try {
@@ -50,7 +62,7 @@
 
   // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped upload APIs
   const diag = {
-    version: 'v3.2.0',
+    version: 'v3.3.0',
     chunks: 0,
     paced: 0,
     dedupPaced: 0,
@@ -67,8 +79,10 @@
   function updateChip() {
     if (!chipEl) return;
     const bgLabel = hiddenMode.enabled ? ' \u00B7 bg unlimited' : '';
-    const statLabel = diag.paced > 0 ? ` (${diag.paced})` : '';
-    chipEl.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${bgLabel}${statLabel}`;
+    const statLabel = diag.paced > 0 ? ` [${diag.paced}]` : '';
+    const mibPerSec = limit.mbps ? ((limit.mbps * 1e6) / 8 / (1024 * 1024)).toFixed(1) : null;
+    const speedLabel = limit.mbps ? `${limit.mbps} Mbps (${mibPerSec} MiB/s)` : 'unlimited';
+    chipEl.textContent = `Kio: ${speedLabel}${bgLabel}${statLabel}`;
   }
 
   function showModeChip() {
@@ -92,7 +106,12 @@
   let queueTimer = 0;
 
   // Network speeds use decimal Mbps (1 Mbps = 1,000,000 bits/s = 125 bytes/ms)
-  const bytesPerMs = () => (limit.mbps * 1000 * 1000) / 8 / 1000;
+  const bytesPerMs = (mbps = limit.mbps) => (mbps * 1000 * 1000) / 8 / 1000;
+  // Scale batch size with target speed (~18ms per batch) so Chrome's 4ms timer floor never caps high speeds
+  const streamBatchBytes = () => {
+    const raw = Math.ceil((bytesPerMs() * 18) / 65536) * 65536;
+    return Math.max(MIN_STREAM_BATCH_BYTES, Math.min(MAX_STREAM_BATCH_BYTES, raw));
+  };
 
   let scheduleHiddenWait = null;
 
@@ -111,9 +130,13 @@
       }
       const now = performance.now();
       const pacingOn = isPacingActive();
+      const clockKey = item.dedup ? 'nextDedupAt' : 'nextSendAt';
+      // Keep dedup checks at >= 140 Mbps (~0.96s per 16 MiB) so kio.ac's 1s chart never drops to 0 B/s
+      const rateMbps = item.dedup ? Math.max(limit.mbps, 140) : limit.mbps;
+      const targetAt = limit[clockKey];
       const pastDeadline = item.deadline && now >= item.deadline;
-      if (pacingOn && !pastDeadline && now < limit.nextSendAt) {
-        const capWait = item.deadline ? Math.min(limit.nextSendAt - now, item.deadline - now) : limit.nextSendAt - now;
+      if (pacingOn && !pastDeadline && now < targetAt) {
+        const capWait = item.deadline ? Math.min(targetAt - now, item.deadline - now) : targetAt - now;
         const waitMs = Math.max(1, Math.ceil(capWait));
         if (document.hidden && scheduleHiddenWait) {
           scheduleHiddenWait(waitMs);
@@ -125,22 +148,23 @@
       sliceQueue.shift();
       if (pacingOn) {
         diag.paced += 1;
-        limit.nextSendAt = Math.max(now, limit.nextSendAt) + item.bytes / bytesPerMs();
+        limit[clockKey] = Math.max(now, targetAt) + item.bytes / bytesPerMs(rateMbps);
       } else {
         diag.unlimited += 1;
         if (hiddenMode.enabled && document.hidden) diag.hiddenUnlimited += 1;
-        limit.nextSendAt = 0;
+        limit[clockKey] = 0;
       }
       if (diag.paced <= 3 || diag.paced % 20 === 0) updateChip();
       item.send();
     }
   }
 
-  // Console helper: `kioUploadSpeed(110)` caps upload at 110 Mbps, `kioUploadSpeed(0)` removes the cap
-  win.kioUploadSpeed = function (mbps) {
+  // Console helper: `kioUploadSpeed(110)` caps at 110 Mbps; `kioUploadSpeed('95MB')` caps at 95 MiB/s (~797 Mbps)
+  win.kioUploadSpeed = function (mbps, unit) {
     if (mbps === undefined) return limit.mbps;
-    limit.mbps = normalizeMbps(mbps);
+    limit.mbps = normalizeMbps(mbps, unit);
     limit.nextSendAt = 0;
+    limit.nextDedupAt = 0;
     try {
       localStorage.setItem(STORAGE_MBPS_KEY, String(limit.mbps));
     } catch {}
@@ -154,6 +178,7 @@
     if (enabled === undefined) return hiddenMode.enabled;
     hiddenMode.enabled = Boolean(enabled);
     limit.nextSendAt = 0;
+    limit.nextDedupAt = 0;
     try {
       localStorage.setItem(STORAGE_BG_KEY, String(hiddenMode.enabled));
     } catch {}
@@ -183,11 +208,12 @@
     });
   }
 
-  // Pace dedup-skipped (exists: true) worker replies so local SHA-256 + UI speed also respect limit.mbps
+  // Pace dedup-skipped (exists: true) worker replies so local SHA-256 + UI speed stay smooth and low-CPU
   function paceDedupReply(bytes, isTerminated, deliver) {
     diag.dedupPaced += 1;
     sliceQueue.push({
       bytes,
+      dedup: true,
       deadline: performance.now() + 45000, // stay well under kio.ac's 60s worker chunk timeout
       aborted: isTerminated,
       send: deliver,
@@ -426,8 +452,9 @@
               return;
             }
 
+            const batchBytes = streamBatchBytes();
             if (isPacingActive()) {
-              await waitStreamTurn(STREAM_BATCH_BYTES, () => cancelled || Boolean(signal?.aborted));
+              await waitStreamTurn(batchBytes, () => cancelled || Boolean(signal?.aborted));
             }
             if (cancelled || signal?.aborted) {
               try {
@@ -445,14 +472,14 @@
               carry = null;
             }
 
-            while (emitted < STREAM_BATCH_BYTES) {
+            while (emitted < batchBytes) {
               const { done, value } = await reader.read();
               if (done) {
                 controller.close();
                 return;
               }
               if (value && value.byteLength) {
-                if (emitted + value.byteLength > STREAM_BATCH_BYTES && emitted > 0) {
+                if (emitted + value.byteLength > batchBytes && emitted > 0) {
                   carry = value;
                   return;
                 }
