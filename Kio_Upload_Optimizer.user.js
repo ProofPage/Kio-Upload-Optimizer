@@ -22,8 +22,7 @@
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
 
-  // The cap can only average out chunks this large. Untested: bring the hashed buffer into the DOM cache —
-  // whole chunks leave one shared queue under a fixed byte window (Mbps, 0 = unlimited)
+  // The cap can only average out chunks this large; whole chunks leave one shared queue under a fixed byte window (Mbps, 0 = unlimited)
   const SLICE_BYTES = 16 * 1024 * 1024;
   // Change these two numbers to tune behaviour; no console command or settings page needed
   const LIMIT_MBPS = 110; // upload cap in Mbps (0 = no cap)
