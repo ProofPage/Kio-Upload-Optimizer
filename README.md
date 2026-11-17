@@ -13,15 +13,18 @@
   - Normally `kio.ac` reads every 16 MiB chunk twice through Chrome's Browser process (`Blob` IPC): once to compute `SHA-256` inside `streaming-worker`, and a second time when uploading the `Blob` (or 256 × 64 KiB `ReadableStream` slices).
   - Transfers the already-hashed `ArrayBuffer` back from `streaming-worker` (zero-copy, bounded 10-chunk LRU cache) and serves both 64 KiB stream slices (capped foreground) and `XMLHttpRequest.send(Uint8Array)` (unlimited/background) directly from RAM with automatic fallback to normal `Blob` reads.
 
-- **Smooth Upload Speed Cap (110 Mbps by default) + Native XHR in Unlimited Mode**:
-  - Works as installed: the cap is **110 Mbps** and no console command or settings page is needed. The current mode is shown in a small chip at the bottom-right of the page.
-  - To change it, edit the single `LIMIT_MBPS` constant near the top of the script in your userscript manager (`0` = no cap).
-  - While the cap is active in the foreground, each `/edge/v4/upload` `ReadableStream` is paced in `256 KiB` batches through a single shared byte-budget queue (~19 ms per batch across all upload threads), keeping real-time speed steady at ~110 Mbps without 16 MiB network bursts.
-  - When unlimited (`LIMIT_MBPS = 0` or background tab with `UNLIMITED_IN_BACKGROUND = true`), `fetch` `duplex: "half"` is rejected so `kio.ac` falls back to single-`PUT` native `XMLHttpRequest` for lowest CPU usage.
+- **Smooth Upload Speed Cap (110 Mbps by default) + `kioUploadSpeed(mbps)`**:
+  - Works as installed at **110 Mbps** and stays active even if you switch tabs or cover the browser window (`kioBackground(false)` by default). The current mode and active paced batch count are shown in the bottom-right chip.
+  - To change the cap live in the DevTools console (saved in `localStorage`):
+    - `kioUploadSpeed(110)` — cap at `110` Mbps (default)
+    - `kioUploadSpeed(0)` — disable cap (unlimited)
+    - `kioBackground(true)` — lift the cap while the tab is hidden (`false` keeps the cap everywhere)
+  - While the cap is active, each `/edge/v4/upload` `ReadableStream` is paced in `256 KiB` batches through a single shared byte-budget queue (~19 ms per batch across all upload threads), keeping real-time speed steady at ~110 Mbps without 16 MiB network bursts.
+  - When unlimited (`kioUploadSpeed(0)` or background tab with `kioBackground(true)`), `fetch` `duplex: "half"` is rejected so `kio.ac` falls back to single-`PUT` native `XMLHttpRequest` for lowest CPU usage.
 
 - **Background Upload Support**:
   - Chrome clamps hidden-tab timers to 1 second and suspends `requestAnimationFrame`, which stalls paced queues once the tab is hidden.
-  - By default (`UNLIMITED_IN_BACKGROUND = true`), switching away from the tab lifts the cap immediately and switches new chunks to native `XMLHttpRequest` at full speed. Set it to `false` in the script to keep the Mbps limit everywhere via the built-in Worker timer.
+  - By default (`kioBackground(false)`), the queue runs on an exact-delay Web Worker timer so the `110 Mbps` cap stays smooth even in a hidden tab. Run `kioBackground(true)` to lift the cap in the background and switch to full-speed native `XMLHttpRequest`.
 
 - **Progress UI Update Throttling**:
   - Throttles `/edge/v4/upload` `XMLHttpRequest.upload.onprogress` callbacks to `500ms` intervals (matching `kio.ac`'s internal 500ms speed meter) while always forwarding final completion bytes immediately, cutting Svelte reactive DOM updates without affecting transferred byte accuracy.
@@ -40,7 +43,7 @@
    - [Violentmonkey](https://violentmonkey.github.io/) (Recommended)
    - [Tampermonkey](https://www.tampermonkey.net/)
 2. Open the userscript installation URL:
-   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@00c633d3f79f254b0d8631de65d247fcc53c76f7/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
+   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@0fb3f7fbebc646ee38b57459013a53ce7dd6b1e8/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload. The cap (110 Mbps) and background mode are already on.
    - Updating from an older version? Reload the `/upload` tab and restart the upload. Uploads already running keep the old speed, because `kio.ac` builds its uploader once per page load.
