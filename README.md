@@ -16,11 +16,12 @@
 - **Smooth Upload Speed Cap (110 Mbps by default) + `kioUploadSpeed(mbps)`**:
   - Works as installed at **110 Mbps** and stays active even if you switch tabs or cover the browser window (`kioBackground(false)` by default). The current mode and active paced batch count are shown in the bottom-right chip.
   - To change the cap live in the DevTools console (saved in `localStorage`):
-    - `kioUploadSpeed(110)` — cap at `110` Mbps (default)
+    - `kioUploadSpeed(110)` — cap at `110` Mbps (`13.1 MiB/s`, default)
+    - `kioUploadSpeed('95MB')` (or `kioUploadSpeed(95, 'MB')`) — cap at `95 MiB/s` (`~797 Mbps`, matching the unit `kio.ac` displays)
     - `kioUploadSpeed(0)` — disable cap (unlimited)
     - `kioBackground(true)` — lift the cap while the tab is hidden (`false` keeps the cap everywhere)
-  - While the cap is active, each `/edge/v4/upload` `ReadableStream` is paced in `256 KiB` batches through a single shared byte-budget queue (~19 ms per batch across all upload threads), keeping real-time speed steady at ~110 Mbps without 16 MiB network bursts.
-  - Deduplication-skipped chunks (`exists: true`) also share the same byte-budget queue (capped at a 45 s safety deadline under `kio.ac`'s 60 s chunk timeout), keeping local `SHA-256` hashing CPU, disk reads, and the UI speed meter within the configured `Mbps` limit.
+  - While the cap is active, each `/edge/v4/upload` `ReadableStream` is paced in dynamically sized batches (`256 KiB`–`4 MiB`, ~18 ms per batch across all upload threads), keeping real-time speed steady without 16 MiB bursts or 4 ms timer bottlenecks at high caps.
+  - Deduplication-skipped chunks (`exists: true`) are paced at `>= 140 Mbps` (~0.96 s per 16 MiB chunk) under a 45 s safety deadline, keeping local `SHA-256` hashing CPU low without dipping `kio.ac`'s 1 s speed meter to `0 B/s`.
   - When unlimited (`kioUploadSpeed(0)` or background tab with `kioBackground(true)`), `fetch` `duplex: "half"` is rejected so `kio.ac` falls back to single-`PUT` native `XMLHttpRequest` for lowest CPU usage.
 
 - **Background Upload Support**:
@@ -44,7 +45,7 @@
    - [Violentmonkey](https://violentmonkey.github.io/) (Recommended)
    - [Tampermonkey](https://www.tampermonkey.net/)
 2. Open the userscript installation URL:
-   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@3a1d51d30635eb2df9f20cc68aa9e03100c0cf1e/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
+   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@15886d14705086b0cc5f5fe764fe1da950c23675/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload. The cap (110 Mbps) and background mode are already on.
    - Updating from an older version? Reload the `/upload` tab and restart the upload. Uploads already running keep the old speed, because `kio.ac` builds its uploader once per page load.
