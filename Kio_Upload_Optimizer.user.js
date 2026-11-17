@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.3.0
-// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
+// @version      2.4.0
+// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -20,6 +20,62 @@
 
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
+
+  // Bandwidth cap: whole chunks are released from one shared queue under a fixed byte window (Mbps, 0 = unlimited)
+  const SLICE_BYTES = 16 * 1024 * 1024;
+  const limit = { mbps: 0, windowMs: 250, windowStart: 0, windowBytes: 0 };
+  const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  // Chrome throttles hidden-tab timers to 1s, so a background tab uses 4x wider windows
+  const pacingWindowMs = () => (document.hidden ? limit.windowMs * 4 : limit.windowMs);
+
+  function applyMbps(mbps) {
+    const value = Number(mbps);
+    limit.mbps = Number.isFinite(value) && value > 0 ? Math.min(value, 2000) : 0;
+  }
+
+  try {
+    chrome.storage.local.get('kio_upload_mbps', (res) => applyMbps(res?.kio_upload_mbps));
+  } catch {}
+
+  // Console helper: `kioUploadSpeed(80)` caps the upload at 80 Mbps, `kioUploadSpeed(0)` removes the cap
+  win.kioUploadSpeed = function (mbps) {
+    applyMbps(mbps);
+    try {
+      chrome.storage.local.set({ kio_upload_mbps: limit.mbps });
+    } catch {}
+    return limit.mbps;
+  };
+
+  // One shared queue paced by the window budget, so chunks never exceed the cap and never go out of order
+  const sliceQueue = [];
+
+  function drainSliceQueue() {
+    const now = performance.now();
+    const windowMs = pacingWindowMs();
+    if (!limit.windowStart || now - limit.windowStart >= windowMs) {
+      limit.windowStart = now;
+      limit.windowBytes = 0;
+    }
+
+    const budget = ((limit.mbps * 1024 * 1024) / 8) * (windowMs / 1000);
+    while (sliceQueue.length && limit.windowBytes + SLICE_BYTES <= budget) {
+      limit.windowBytes += SLICE_BYTES;
+      sliceQueue.shift()();
+    }
+
+    if (sliceQueue.length) {
+      setTimeout(drainSliceQueue, Math.max(1, windowMs - (now - limit.windowStart)));
+    }
+  }
+
+  function paceSlice(sendSlice) {
+    if (limit.mbps <= 0) {
+      sendSlice();
+      return;
+    }
+    sliceQueue.push(sendSlice);
+    if (sliceQueue.length === 1) drainSliceQueue();
+  }
 
   // Shared cache to avoid reading each 16 MiB chunk twice (once for SHA-256, once for XHR upload)
   const bufToBlob = new WeakMap();
@@ -206,13 +262,15 @@
     };
   }
 
-  // 3) Reuse cached memory buffer on XHR send (skipping duplicate browser Blob read) & throttle progress to 500ms
+  // 3) Pace chunk uploads, reuse hashed buffers (no duplicate Blob read), throttle progress to 500ms
   if (typeof XMLHttpRequest !== 'undefined') {
     try {
       const throttledUploads = new WeakSet();
       const origOpen = XMLHttpRequest.prototype.open;
-      XMLHttpRequest.prototype.open = function (method, url) {
+      XMLHttpRequest.prototype.open = function (method, url, async) {
         try {
+          this.__kioOpen = [method, url, async];
+          this.__kioHeaders = [];
           if (String(url).includes('/edge/v4/upload')) {
             throttledUploads.add(this.upload);
           } else {
@@ -222,15 +280,95 @@
         return origOpen.apply(this, arguments);
       };
 
+      const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+      XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        try {
+          this.__kioHeaders?.push([name, value]);
+        } catch {}
+        return origSetRequestHeader.apply(this, arguments);
+      };
+
       const origSend = XMLHttpRequest.prototype.send;
+
+      // kio.ac creates the XHR inside the sender callback, so only here can open() + headers be copied over
+      const startPacedSend = (origin, body) => {
+        const [method, url, async] = origin.__kioOpen;
+        const paced = new XMLHttpRequest();
+        paced.open(method, url, async);
+        paced.responseType = origin.responseType;
+        paced.withCredentials = origin.withCredentials;
+        paced.timeout = origin.timeout;
+        paced.__kioPaced = true;
+
+        for (const [name, value] of origin.__kioHeaders || []) paced.setRequestHeader(name, value);
+
+        for (const prop of [
+          'onloadstart',
+          'onprogress',
+          'onabort',
+          'onerror',
+          'onload',
+          'ontimeout',
+          'onloadend',
+          'onreadystatechange',
+        ]) {
+          paced[prop] = origin[prop];
+        }
+        paced.upload.onprogress = origin.upload.onprogress;
+
+        const cached = body instanceof Blob ? cachedBlobBufs.get(body) : null;
+        const payload = cached && cached.byteLength === body.size ? new Uint8Array(cached) : body;
+        if (payload !== body) paced.__kioCachedBlob = body;
+
+        paced.addEventListener(
+          'loadend',
+          () => {
+            const cachedBody = paced.__kioCachedBlob;
+            if (cachedBody) {
+              paced.__kioCachedBlob = null;
+              if (paced.status >= 200 && paced.status < 300) cachedBlobBufs.delete(cachedBody);
+            }
+          },
+          { once: true },
+        );
+
+        origin.__kioPaced = paced;
+        paceSlice(() => paced.send(payload));
+      };
+
+      // Page code checks readyState and attaches listeners after send(), so it keeps seeing the real request
+      function proxyXhr(origin) {
+        return new Proxy(origin, {
+          get(target, prop) {
+            if (prop === 'send') return (body) => startPacedSend(target, body);
+            const source = target.__kioPaced || target;
+            const value = prop === 'upload' ? source.upload : source[prop];
+            return typeof value === 'function' ? value.bind(source) : value;
+          },
+          set(target, prop, value) {
+            const source = target.__kioPaced || target;
+            if (prop in source) source[prop] = value;
+            return true;
+          },
+        });
+      }
+
       XMLHttpRequest.prototype.send = function (body) {
-        if (body instanceof Blob && throttledUploads.has(this.upload)) {
+        if (throttledUploads.has(this.upload) && limit.mbps > 0) {
+          const xhr = proxyXhr(this);
+          xhr.send(body);
+          return xhr;
+        }
+
+        if (body instanceof Blob) {
           const cached = cachedBlobBufs.get(body);
           if (cached && cached.byteLength === body.size) {
             const xhr = this;
+            xhr.__kioCachedBlob = body;
             xhr.addEventListener(
               'loadend',
               () => {
+                xhr.__kioCachedBlob = null;
                 if (xhr.status >= 200 && xhr.status < 300) {
                   cachedBlobBufs.delete(body);
                 }
@@ -264,7 +402,7 @@
                 : null;
           },
           set(fn) {
-            if (typeof fn !== 'function' || !throttledUploads.has(this)) {
+            if (typeof fn !== 'function' || !throttledUploads.has(this) || !this.__kioPaced) {
               originalHandlers.delete(this);
               return origSet.call(this, fn);
             }
