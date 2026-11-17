@@ -21,6 +21,7 @@
   - Works as installed: the cap is **110 Mbps** and no console command or settings page is needed. The current mode is shown in a small chip at the bottom-right of the page.
   - To change it, edit the single `LIMIT_MBPS` constant near the top of the script in your userscript manager (`0` = no cap).
   - Chunks are released from a single shared queue, so concurrent upload threads cannot exceed the cap together and chunks are never sent out of order. Each chunk still travels as one `PUT`, so server-side hash checks and retries keep working.
+  - The queue holds back a whole 16 MiB chunk, so the queue alone cannot beat the cap. What the cap cannot do is split a chunk: once one is on the wire it finishes at whatever the line allows. On a gigabit-class connection a single 16 MiB `PUT` lasts only a second or two, so the rate you read during an upload still spikes. Splitting a chunk would mean streaming it to the edge so padding can be added before hashing, which breaks if the two codecs race, so the script keeps whole chunks.
 
 - **Background Upload Support**:
   - Chrome clamps hidden-tab timers to 1 second and suspends `requestAnimationFrame`, which stalls the chunk queue once the tab is hidden. The queue is now driven by a tiny dedicated Worker that keeps its own timer budget, so uploads continue while you work in another tab.
@@ -79,13 +80,14 @@ Note: `kio.ac` requires per-chunk `SHA-256` hashes and HTTPS (TLS) transmission,
 
 ### Checking the cap on a live page
 
-Start an upload and type `__kioUploadOptimizer` in the DevTools console. `diag.paced` counts chunks released through the queue, `diag.unlimited` counts chunks sent at full speed (background or cap `0`), and `diag.hiddenUnlimited` tells you how many of those went out while the tab was hidden.
+Start an upload and type `__kioUploadOptimizer` in the DevTools console. `diag.paced` counts chunks released through the queue, `diag.unlimited` counts chunks sent at full speed (background or cap `0`), `diag.hiddenUnlimited` tells you how many of those went out while the tab was hidden, and `diag.queuedPeak` is the deepest the queue ever got.
 
 | What you see | What it means |
 | :--- | :--- |
 | `undefined` | This version of the script is not running in the tab, so reload `/upload`. |
 | `paced` stays `< 2` after a few seconds | The page is not sending through the queue. Turn the experimental uploader off, or the upload went through a path the script does not wrap yet. |
-| `paced` grows fast and the transfer still runs faster than 110 Mbps | The page has more upload threads than the queue can smooth. Set **Upload thread** to `1`. |
+| `paced` grows but `queuedPeak` stays `1` | No backlog builds, so the queue is not what sets the speed. That is the measured line speed or one chunk finishing, not the cap leaking. |
+| `paced` grows fast and the transfer still runs faster than 110 Mbps | Check `queuedPeak`: at `1` the cap never had a second chunk to hold back, so the queue cannot slow the link. |
 | 0 bytes counted but a transfer is clearly moving | The script was installed after the page loaded. Reload the tab and start the upload again. |
 
 ---
