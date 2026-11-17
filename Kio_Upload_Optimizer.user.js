@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      3.1.0
-// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly pacing upload Mbps via kioUploadSpeed(mbps), throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
+// @version      3.2.0
+// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly pacing upload and dedup-hash Mbps via kioUploadSpeed(mbps), throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -50,9 +50,10 @@
 
   // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped upload APIs
   const diag = {
-    version: 'v3.1.0',
+    version: 'v3.2.0',
     chunks: 0,
     paced: 0,
+    dedupPaced: 0,
     unlimited: 0,
     hiddenUnlimited: 0,
     aborted: 0,
@@ -110,8 +111,10 @@
       }
       const now = performance.now();
       const pacingOn = isPacingActive();
-      if (pacingOn && now < limit.nextSendAt) {
-        const waitMs = Math.max(1, Math.ceil(limit.nextSendAt - now));
+      const pastDeadline = item.deadline && now >= item.deadline;
+      if (pacingOn && !pastDeadline && now < limit.nextSendAt) {
+        const capWait = item.deadline ? Math.min(limit.nextSendAt - now, item.deadline - now) : limit.nextSendAt - now;
+        const waitMs = Math.max(1, Math.ceil(capWait));
         if (document.hidden && scheduleHiddenWait) {
           scheduleHiddenWait(waitMs);
         } else {
@@ -178,6 +181,19 @@
       diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
       drainSliceQueue();
     });
+  }
+
+  // Pace dedup-skipped (exists: true) worker replies so local SHA-256 + UI speed also respect limit.mbps
+  function paceDedupReply(bytes, isTerminated, deliver) {
+    diag.dedupPaced += 1;
+    sliceQueue.push({
+      bytes,
+      deadline: performance.now() + 45000, // stay well under kio.ac's 60s worker chunk timeout
+      aborted: isTerminated,
+      send: deliver,
+    });
+    diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
+    drainSliceQueue();
   }
 
   window.__kioUploadOptimizer = {
@@ -314,6 +330,7 @@
           const origPostMessage = worker.postMessage.bind(worker);
           const origAddEventListener = worker.addEventListener.bind(worker);
           const origTerminate = worker.terminate.bind(worker);
+          let terminated = false;
 
           worker.postMessage = function (msg, transfer) {
             try {
@@ -332,14 +349,25 @@
             if (type === 'message' && typeof listener === 'function') {
               const wrapped = function (ev) {
                 const data = ev?.data;
+                let blob = null;
                 if (data && typeof data.id === 'string') {
-                  const blob = idToBlob.get(data.id);
+                  blob = idToBlob.get(data.id);
                   idToBlob.delete(data.id);
                   if (data.__kioChunk instanceof ArrayBuffer) {
                     const chunkBuf = data.__kioChunk;
                     delete data.__kioChunk;
                     if (blob) setCachedBuf(blob, chunkBuf);
                   }
+                }
+                if (data && data.success && data.exists && isPacingActive()) {
+                  const ctx = this;
+                  const chunkBytes = blob && typeof blob.size === 'number' ? blob.size : SLICE_BYTES;
+                  paceDedupReply(
+                    chunkBytes,
+                    () => terminated,
+                    () => listener.call(ctx, ev),
+                  );
+                  return;
                 }
                 return listener.call(this, ev);
               };
@@ -349,8 +377,10 @@
           };
 
           worker.terminate = function () {
+            terminated = true;
             idToBlob.clear();
             cachedBlobBufs.clear();
+            drainSliceQueue();
             return origTerminate();
           };
 
