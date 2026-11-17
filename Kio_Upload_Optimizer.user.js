@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      3.4.0
-// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly capping upload and dedup-hash speed in MiB/s (default 95 MiB/s via kioUploadSpeed), throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
+// @version      4.0.0
+// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate disk reads (both Streaming and Legacy uploaders), forcing native XHR transfers, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -18,81 +18,27 @@
 (() => {
   'use strict';
 
-  // A previously installed copy of this userscript would double-wrap the hooks and break the cap
+  // A previously installed copy of this userscript would double-wrap hooks
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
 
-  const SLICE_BYTES = 16 * 1024 * 1024;
-  const MIN_STREAM_BATCH_BYTES = 256 * 1024;
-  const MAX_STREAM_BATCH_BYTES = 4 * 1024 * 1024;
-  const DEFAULT_MIBS = 95; // default cap in MiB/s matching kio.ac's speed display (0 = no cap)
-  const STORAGE_MIBS_KEY = 'kio_upload_mibs';
-  const STORAGE_BG_KEY = 'kio_bg_unrestricted';
-  const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-
-  const limit = { mibs: DEFAULT_MIBS, nextSendAt: 0, nextDedupAt: 0 };
-  const hiddenMode = { enabled: false }; // stay capped even when occluded or in another tab unless kioBackground(true)
-
-  function normalizeMiBs(speed, unit) {
-    if (typeof speed === 'string') {
-      const m = speed.trim().match(/^(\d+(?:\.\d+)?)\s*(mbps|mib|mb|m)?(?:\/s|ps)?$/i);
-      if (!m) return 0;
-      const num = Number(m[1]);
-      const u = (unit || m[2] || '').toLowerCase();
-      const mibs = u === 'mbps' ? (num * 1e6) / 8 / (1024 * 1024) : num;
-      return Number.isFinite(mibs) && mibs > 0 ? Math.min(Math.round(mibs * 10) / 10, 1000) : 0;
-    }
-    const value = Number(speed);
-    if (!Number.isFinite(value) || value <= 0) return 0;
-    const u = typeof unit === 'string' ? unit.trim().toLowerCase() : '';
-    const mibs = u === 'mbps' ? (value * 1e6) / 8 / (1024 * 1024) : value;
-    return Math.min(Math.round(mibs * 10) / 10, 1000);
-  }
-
-  try {
-    const savedMibs = localStorage.getItem(STORAGE_MIBS_KEY);
-    if (savedMibs !== null) limit.mibs = normalizeMiBs(savedMibs);
-    const savedBg = localStorage.getItem(STORAGE_BG_KEY);
-    if (savedBg !== null) hiddenMode.enabled = savedBg === 'true';
-  } catch {}
-
-  function isPacingActive() {
-    return limit.mibs > 0 && !(hiddenMode.enabled && document.hidden);
-  }
-
-  // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped upload APIs
   const diag = {
-    version: 'v3.4.0',
-    chunks: 0,
-    paced: 0,
-    dedupPaced: 0,
-    unlimited: 0,
-    hiddenUnlimited: 0,
-    aborted: 0,
-    streamedBytes: 0,
-    ramSliceHits: 0,
-    xhrFallbacks: 0,
-    queuedPeak: 0,
+    version: 'v4.0.0',
+    reusedBufs: 0,
+    blobFallbacks: 0,
+    throttledProgress: 0,
+    postTaskSaved: 0,
+    rafCapped: 0,
   };
-
-  let chipEl = null;
-  function updateChip() {
-    if (!chipEl) return;
-    const bgLabel = hiddenMode.enabled ? ' \u00B7 bg unlimited' : '';
-    const statLabel = diag.paced > 0 ? ` [${diag.paced}]` : '';
-    const mbps = limit.mibs ? Math.round((limit.mibs * 1024 * 1024 * 8) / 1e6) : null;
-    const speedLabel = limit.mibs ? `${limit.mibs} MiB/s (${mbps} Mbps)` : 'unlimited';
-    chipEl.textContent = `Kio: ${speedLabel}${bgLabel}${statLabel}`;
-  }
+  window.__kioUploadOptimizer = { version: diag.version, diag };
 
   function showModeChip() {
-    if (chipEl) return;
-    chipEl = document.createElement('div');
-    chipEl.style.cssText =
+    const chip = document.createElement('div');
+    chip.textContent = 'Kio: CPU Optimized';
+    chip.style.cssText =
       'position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:4px 8px;border-radius:6px;' +
-      'background:rgba(17,17,17,.85);color:#fff;font:12px/1.4 system-ui,sans-serif;pointer-events:none;opacity:.8';
-    updateChip();
-    document.documentElement.appendChild(chipEl);
+      'background:rgba(17,17,17,.85);color:#fff;font:12px/1.4 system-ui,sans-serif;pointer-events:none;opacity:.75';
+    document.documentElement.appendChild(chip);
   }
 
   if (document.readyState === 'loading') {
@@ -101,143 +47,13 @@
     showModeChip();
   }
 
-  // One shared queue paced by nextSendAt, used by both stream batches (256 KiB) and XHR fallback chunks
-  const sliceQueue = [];
-  let queueTimer = 0;
-
-  // Exact MiB/s byte rate matching kio.ac's speed readout (1 MiB/s = 1,048,576 bytes/s = 1,048.576 bytes/ms)
-  const bytesPerMs = (mibs = limit.mibs) => (mibs * 1024 * 1024) / 1000;
-  // Scale batch size with target speed (~24ms per batch) so Chrome's 4ms timer floor never caps high speeds
-  const streamBatchBytes = () => {
-    const raw = Math.ceil((bytesPerMs() * 24) / 65536) * 65536;
-    return Math.max(MIN_STREAM_BATCH_BYTES, Math.min(MAX_STREAM_BATCH_BYTES, raw));
-  };
-
-  let scheduleHiddenWait = null;
-
-  function drainSliceQueue() {
-    if (queueTimer) {
-      clearTimeout(queueTimer);
-      queueTimer = 0;
-    }
-    while (sliceQueue.length) {
-      const item = sliceQueue[0];
-      if (item.aborted()) {
-        sliceQueue.shift();
-        diag.aborted += 1;
-        item.onAbort?.();
-        continue;
-      }
-      const now = performance.now();
-      const pacingOn = isPacingActive();
-      const clockKey = item.dedup ? 'nextDedupAt' : 'nextSendAt';
-      // Keep dedup checks at >= 16.7 MiB/s (~0.96s per 16 MiB) so kio.ac's 1s chart never drops to 0 B/s
-      const rateMiBs = item.dedup ? Math.max(limit.mibs, 16.7) : limit.mibs;
-      const targetAt = limit[clockKey];
-      const pastDeadline = item.deadline && now >= item.deadline;
-      if (pacingOn && !pastDeadline && now < targetAt) {
-        const capWait = item.deadline ? Math.min(targetAt - now, item.deadline - now) : targetAt - now;
-        const waitMs = Math.max(1, Math.ceil(capWait));
-        if (document.hidden && scheduleHiddenWait) {
-          scheduleHiddenWait(waitMs);
-        } else {
-          queueTimer = setTimeout(drainSliceQueue, waitMs);
-        }
-        return;
-      }
-      sliceQueue.shift();
-      if (pacingOn) {
-        diag.paced += 1;
-        limit[clockKey] = Math.max(now, targetAt) + item.bytes / bytesPerMs(rateMiBs);
-      } else {
-        diag.unlimited += 1;
-        if (hiddenMode.enabled && document.hidden) diag.hiddenUnlimited += 1;
-        limit[clockKey] = 0;
-      }
-      if (diag.paced <= 3 || diag.paced % 20 === 0) updateChip();
-      item.send();
-    }
-  }
-
-  // Console helper: `kioUploadSpeed(95)` caps at 95 MiB/s (matching kio.ac display); `kioUploadSpeed(0)` removes cap
-  win.kioUploadSpeed = function (speed, unit) {
-    if (speed === undefined) return limit.mibs;
-    limit.mibs = normalizeMiBs(speed, unit);
-    limit.nextSendAt = 0;
-    limit.nextDedupAt = 0;
-    try {
-      localStorage.setItem(STORAGE_MIBS_KEY, String(limit.mibs));
-    } catch {}
-    updateChip();
-    drainSliceQueue();
-    return limit.mibs;
-  };
-
-  // Console helper: `kioBackground(true)` lifts the cap while the tab is hidden; default is false (always capped)
-  win.kioBackground = function (enabled) {
-    if (enabled === undefined) return hiddenMode.enabled;
-    hiddenMode.enabled = Boolean(enabled);
-    limit.nextSendAt = 0;
-    limit.nextDedupAt = 0;
-    try {
-      localStorage.setItem(STORAGE_BG_KEY, String(hiddenMode.enabled));
-    } catch {}
-    updateChip();
-    drainSliceQueue();
-    return hiddenMode.enabled;
-  };
-
-  function paceSlice(send, bytes, aborted) {
-    diag.chunks += 1;
-    sliceQueue.push({ send, bytes, aborted });
-    diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
-    drainSliceQueue();
-  }
-
-  // Reserve a byte-budget turn for a stream batch; resolves even on abort so pull() can exit cleanly
-  function waitStreamTurn(bytes, isAborted) {
-    return new Promise((resolve) => {
-      sliceQueue.push({
-        bytes,
-        aborted: isAborted,
-        send: resolve,
-        onAbort: resolve,
-      });
-      diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
-      drainSliceQueue();
-    });
-  }
-
-  // Pace dedup-skipped (exists: true) worker replies so local SHA-256 + UI speed stay smooth and low-CPU
-  function paceDedupReply(bytes, isTerminated, deliver) {
-    diag.dedupPaced += 1;
-    sliceQueue.push({
-      bytes,
-      dedup: true,
-      deadline: performance.now() + 45000, // stay well under kio.ac's 60s worker chunk timeout
-      aborted: isTerminated,
-      send: deliver,
-    });
-    diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
-    drainSliceQueue();
-  }
-
-  window.__kioUploadOptimizer = {
-    version: diag.version,
-    limit,
-    hiddenMode,
-    diag,
-    isPacingActive,
-    queueLength: () => sliceQueue.length,
-  };
-
-  // Shared cache to avoid reading each 16 MiB chunk twice (once for SHA-256, once for upload)
+  // Shared bounded LRU cache (<= 160 MiB) to avoid reading each 16 MiB chunk twice (hash + upload)
   const bufToBlob = new WeakMap();
-  const sliceMeta = new WeakMap();
   const cachedBlobBufs = new Map();
-  const MAX_CACHED_CHUNKS = 10; // <= 160 MiB cap
+  const MAX_CACHED_CHUNKS = 10;
 
   function setCachedBuf(blob, buf) {
+    if (!blob || !(buf instanceof ArrayBuffer) || buf.byteLength === 0) return;
     if (cachedBlobBufs.has(blob)) cachedBlobBufs.delete(blob);
     cachedBlobBufs.set(blob, buf);
     while (cachedBlobBufs.size > MAX_CACHED_CHUNKS) {
@@ -246,40 +62,18 @@
     }
   }
 
-  // 1) Track large chunk Blob -> ArrayBuffer reads, recycle hashed buffers, and serve 64 KiB stream slices from RAM
-  if (typeof Blob !== 'undefined' && typeof Blob.prototype.slice === 'function') {
-    const origSlice = Blob.prototype.slice;
-    Blob.prototype.slice = function (start, end) {
-      const sliced = origSlice.apply(this, arguments);
-      try {
-        if (cachedBlobBufs.has(this)) {
-          const size = this.size;
-          const relStart = start == null ? 0 : Number(start);
-          const s = relStart < 0 ? Math.max(size + relStart, 0) : Math.min(relStart, size);
-          const relEnd = end == null ? size : Number(end);
-          const e = relEnd < 0 ? Math.max(size + relEnd, 0) : Math.min(relEnd, size);
-          if (e >= s) sliceMeta.set(sliced, { parent: this, start: s, end: e });
-        }
-      } catch {}
-      return sliced;
-    };
-  }
-
+  // 1) Track large chunk Blob -> ArrayBuffer reads and recycle hashed buffers from streaming-worker
   if (typeof Blob !== 'undefined' && typeof Blob.prototype.arrayBuffer === 'function') {
     const origArrayBuffer = Blob.prototype.arrayBuffer;
     Blob.prototype.arrayBuffer = function () {
       const blob = this;
-      const meta = sliceMeta.get(blob);
-      if (meta) {
-        const cached = cachedBlobBufs.get(meta.parent);
-        if (cached && meta.end <= cached.byteLength) {
-          diag.ramSliceHits += 1;
-          return Promise.resolve(cached.slice(meta.start, meta.end));
-        }
-      }
       return origArrayBuffer.call(blob).then((buf) => {
-        if (buf && buf.byteLength >= 1024 * 1024) {
+        if (buf && buf.byteLength >= 1024 * 1024 && buf.byteLength <= 32 * 1024 * 1024) {
           bufToBlob.set(buf, blob);
+          // Also cache for LegacyUploader (which keeps buf on main thread instead of transferring to Worker)
+          if (location.pathname.startsWith('/upload')) {
+            setCachedBuf(blob, buf);
+          }
         }
         return buf;
       });
@@ -356,7 +150,6 @@
           const origPostMessage = worker.postMessage.bind(worker);
           const origAddEventListener = worker.addEventListener.bind(worker);
           const origTerminate = worker.terminate.bind(worker);
-          let terminated = false;
 
           worker.postMessage = function (msg, transfer) {
             try {
@@ -365,6 +158,8 @@
                 if (blob) {
                   idToBlob.set(msg.id, blob);
                   bufToBlob.delete(msg.chunk);
+                  // Remove detached main-thread entry until worker transfers the live buffer back
+                  cachedBlobBufs.delete(blob);
                 }
               }
             } catch {}
@@ -375,25 +170,14 @@
             if (type === 'message' && typeof listener === 'function') {
               const wrapped = function (ev) {
                 const data = ev?.data;
-                let blob = null;
                 if (data && typeof data.id === 'string') {
-                  blob = idToBlob.get(data.id);
+                  const blob = idToBlob.get(data.id);
                   idToBlob.delete(data.id);
                   if (data.__kioChunk instanceof ArrayBuffer) {
                     const chunkBuf = data.__kioChunk;
                     delete data.__kioChunk;
                     if (blob) setCachedBuf(blob, chunkBuf);
                   }
-                }
-                if (data && data.success && data.exists && isPacingActive()) {
-                  const ctx = this;
-                  const chunkBytes = blob && typeof blob.size === 'number' ? blob.size : SLICE_BYTES;
-                  paceDedupReply(
-                    chunkBytes,
-                    () => terminated,
-                    () => listener.call(ctx, ev),
-                  );
-                  return;
                 }
                 return listener.call(this, ev);
               };
@@ -403,10 +187,8 @@
           };
 
           worker.terminate = function () {
-            terminated = true;
             idToBlob.clear();
             cachedBlobBufs.clear();
-            drainSliceQueue();
             return origTerminate();
           };
 
@@ -416,123 +198,71 @@
     } catch {}
   }
 
-  // 2) Smoothly pace duplex ReadableStream uploads when cap is active; switch to native XHR in unlimited mode
+  // 2) Force native XMLHttpRequest uploads instead of 64 KiB ReadableStream slicing
+  if (typeof Request !== 'undefined') {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(Request.prototype, 'duplex');
+      if (!desc || desc.configurable) {
+        Object.defineProperty(Request.prototype, 'duplex', {
+          get() {
+            return undefined;
+          },
+          configurable: true,
+        });
+      }
+    } catch {}
+
+    try {
+      const OrigRequest = window.Request;
+      window.Request = new Proxy(OrigRequest, {
+        construct(target, args) {
+          if (args[0] === '/' && args[1]?.duplex === 'half') {
+            throw new TypeError('duplex probe disabled');
+          }
+          return new target(...args);
+        },
+      });
+    } catch {}
+  }
+
   if (typeof window.fetch === 'function') {
     const origFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
       const url = typeof input === 'string' ? input : input?.url || String(input);
-      if (
-        init?.duplex === 'half' &&
-        url.includes('/edge/v4/upload') &&
-        init.body &&
-        typeof init.body.getReader === 'function'
-      ) {
-        if (!isPacingActive()) {
-          // Rejecting duplex falls back cleanly into kio.ac's Fh (native XMLHttpRequest) for lowest background CPU
-          diag.xhrFallbacks += 1;
-          try {
-            Promise.resolve(init.body.cancel?.()).catch(() => {});
-          } catch {}
-          return Promise.reject(new TypeError('duplex disabled in unlimited mode'));
-        }
-
-        const sourceStream = init.body;
-        const reader = sourceStream.getReader();
-        const signal = init.signal;
-        let cancelled = false;
-        let carry = null;
-
-        const pacedStream = new ReadableStream({
-          async pull(controller) {
-            if (cancelled || signal?.aborted) {
-              try {
-                await reader.cancel();
-              } catch {}
-              controller.close();
-              return;
-            }
-
-            const batchBytes = streamBatchBytes();
-            if (isPacingActive()) {
-              await waitStreamTurn(batchBytes, () => cancelled || Boolean(signal?.aborted));
-            }
-            if (cancelled || signal?.aborted) {
-              try {
-                await reader.cancel();
-              } catch {}
-              controller.close();
-              return;
-            }
-
-            let emitted = 0;
-            if (carry) {
-              controller.enqueue(carry);
-              emitted += carry.byteLength;
-              diag.streamedBytes += carry.byteLength;
-              carry = null;
-            }
-
-            while (emitted < batchBytes) {
-              const { done, value } = await reader.read();
-              if (done) {
-                controller.close();
-                return;
-              }
-              if (value && value.byteLength) {
-                if (emitted + value.byteLength > batchBytes && emitted > 0) {
-                  carry = value;
-                  return;
-                }
-                controller.enqueue(value);
-                emitted += value.byteLength;
-                diag.streamedBytes += value.byteLength;
-              }
-            }
-          },
-          cancel(reason) {
-            cancelled = true;
-            return reader.cancel(reason).catch(() => {});
-          },
-        });
-
-        return origFetch(input, { ...init, body: pacedStream });
+      if (init?.duplex === 'half' && url.includes('/edge/v4/upload')) {
+        try {
+          Promise.resolve(init.body?.cancel?.()).catch(() => {});
+        } catch {}
+        return Promise.reject(new TypeError('duplex disabled'));
       }
       return origFetch(input, init);
     };
   }
 
-  // 3) Pace chunk uploads on the original XHR (preserving kio.ac closure state), reuse hashed buffers, throttle progress to 500ms
+  // 3) Reuse hashed buffers in XHR uploads (no duplicate Blob read) and throttle progress UI updates to 500ms
   if (typeof XMLHttpRequest !== 'undefined') {
     try {
-      const throttledXhrs = new WeakSet();
       const throttledUploads = new WeakSet();
       const origOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function (method, url) {
         try {
           if (String(url).includes('/edge/v4/upload')) {
-            throttledXhrs.add(this);
             throttledUploads.add(this.upload);
           } else {
-            throttledXhrs.delete(this);
             throttledUploads.delete(this.upload);
           }
         } catch {}
         return origOpen.apply(this, arguments);
       };
 
-      const origAbort = XMLHttpRequest.prototype.abort;
-      XMLHttpRequest.prototype.abort = function () {
-        this.__kioAborted = true;
-        return origAbort.apply(this, arguments);
-      };
-
       const origSend = XMLHttpRequest.prototype.send;
-
-      function sendWithCachedBuf(xhr, body) {
-        if (body instanceof Blob) {
+      XMLHttpRequest.prototype.send = function (body) {
+        if (body instanceof Blob && throttledUploads.has(this.upload)) {
           const cached = cachedBlobBufs.get(body);
           if (cached && cached.byteLength === body.size) {
+            const xhr = this;
             xhr.__kioCachedBlob = body;
+            diag.reusedBufs += 1;
             xhr.addEventListener(
               'loadend',
               () => {
@@ -544,33 +274,10 @@
               },
               { once: true },
             );
-            return origSend.call(xhr, new Uint8Array(cached));
+            return origSend.call(this, new Uint8Array(cached));
           }
+          diag.blobFallbacks += 1;
         }
-        return origSend.call(xhr, body);
-      }
-
-      XMLHttpRequest.prototype.send = function (body) {
-        if (throttledXhrs.has(this) && limit.mibs > 0) {
-          const xhr = this;
-          xhr.__kioAborted = false;
-          const bytes =
-            body && typeof body.size === 'number'
-              ? body.size
-              : body && typeof body.byteLength === 'number'
-                ? body.byteLength
-                : SLICE_BYTES;
-          paceSlice(
-            () => {
-              if (!xhr.__kioAborted) sendWithCachedBuf(xhr, body);
-            },
-            bytes,
-            () => Boolean(xhr.__kioAborted),
-          );
-          return;
-        }
-
-        if (body instanceof Blob) return sendWithCachedBuf(this, body);
         return origSend.apply(this, arguments);
       };
 
@@ -606,6 +313,7 @@
                 lastRun = now;
                 return fn.call(this, ev);
               }
+              diag.throttledProgress += 1;
             };
             originalHandlers.set(this, fn);
             return origSet.call(this, throttled);
@@ -616,7 +324,6 @@
   }
 
   // 4) Replace 0ms scheduler.postTask busy-wait yields in the streaming uploader (50ms fg / 250ms bg)
-  // A hidden tab gets a native Worker tick instead of setTimeout, since Chrome clamps hidden timers to 1s
   const sched = window.scheduler;
   if (sched && typeof sched.postTask === 'function') {
     const origPostTask = sched.postTask.bind(sched);
@@ -628,6 +335,7 @@
         typeof callback === 'function' &&
         callback.toString().replace(/\s+/g, '') === '()=>{}'
       ) {
+        diag.postTaskSaved += 1;
         const delayMs = document.hidden ? 250 : 50;
         return new Promise((resolve) => {
           setTimeout(() => resolve(callback()), delayMs);
@@ -636,34 +344,6 @@
       return origPostTask(callback, options);
     };
   }
-
-  // A tiny Worker keeps its own timer budget, so hidden tabs pace accurately instead of stalling at Chrome's 1s clamp.
-  try {
-    const bgWorker = new Worker(
-      URL.createObjectURL(
-        new Blob(['self.onmessage=e=>setTimeout(()=>self.postMessage(1),e.data);'], { type: 'text/javascript' }),
-      ),
-    );
-    let bgTickPending = false;
-
-    scheduleHiddenWait = (waitMs) => {
-      if (!bgTickPending) {
-        bgTickPending = true;
-        bgWorker.postMessage(Math.max(1, Math.min(waitMs, 500)));
-      }
-    };
-
-    bgWorker.onmessage = () => {
-      bgTickPending = false;
-      drainSliceQueue();
-    };
-
-    document.addEventListener('visibilitychange', () => {
-      if (sliceQueue.length) {
-        drainSliceQueue();
-      }
-    });
-  } catch {}
 
   // 5) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)
   const origRAF = window.requestAnimationFrame?.bind(window);
@@ -679,6 +359,7 @@
           if (document.hidden) {
             return origRAF(callback);
           }
+          diag.rafCapped += 1;
           const id = nextFakeId--;
           const tid = setTimeout(() => {
             chartTimers.delete(id);
