@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      3.0.0
-// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly pacing upload Mbps without 16 MiB bursts, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
+// @version      3.1.0
+// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly pacing upload Mbps via kioUploadSpeed(mbps), throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -22,27 +22,48 @@
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
 
-  // The cap paces 256 KiB batches across all concurrent streams so speed stays smooth at LIMIT_MBPS without 16 MiB bursts
   const SLICE_BYTES = 16 * 1024 * 1024;
   const STREAM_BATCH_BYTES = 256 * 1024;
-  // Change these two constants to tune behaviour; no console command or settings page needed
-  const LIMIT_MBPS = 110; // upload cap in Mbps (0 = no cap)
-  const UNLIMITED_IN_BACKGROUND = true; // lift the cap while this tab is hidden
-  const limit = { mbps: LIMIT_MBPS, nextSendAt: 0 };
+  const DEFAULT_MBPS = 110; // default upload cap in Mbps (0 = no cap)
+  const STORAGE_MBPS_KEY = 'kio_upload_mbps';
+  const STORAGE_BG_KEY = 'kio_bg_unrestricted';
+  const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-  function isPacingActive() {
-    return !(UNLIMITED_IN_BACKGROUND && document.hidden) && limit.mbps > 0;
+  const limit = { mbps: DEFAULT_MBPS, nextSendAt: 0 };
+  const hiddenMode = { enabled: false }; // stay capped even when occluded or in another tab unless kioBackground(true)
+
+  function normalizeMbps(mbps) {
+    const value = Number(mbps);
+    return Number.isFinite(value) && value > 0 ? Math.min(value, 2000) : 0;
   }
 
-  // Small status chip: shows the hardcoded cap and background mode, no DevTools needed
+  try {
+    const savedMbps = localStorage.getItem(STORAGE_MBPS_KEY);
+    if (savedMbps !== null) limit.mbps = normalizeMbps(savedMbps);
+    const savedBg = localStorage.getItem(STORAGE_BG_KEY);
+    if (savedBg !== null) hiddenMode.enabled = savedBg === 'true';
+  } catch {}
+
+  function isPacingActive() {
+    return limit.mbps > 0 && !(hiddenMode.enabled && document.hidden);
+  }
+
+  let chipEl = null;
+  function updateChip() {
+    if (!chipEl) return;
+    const bgLabel = hiddenMode.enabled ? ' \u00B7 bg unlimited' : '';
+    const statLabel = diag.paced > 0 ? ` (${diag.paced})` : '';
+    chipEl.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${bgLabel}${statLabel}`;
+  }
+
   function showModeChip() {
-    const chip = document.createElement('div');
-    const suffix = UNLIMITED_IN_BACKGROUND ? ' \u00B7 bg unlimited' : '';
-    chip.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${suffix}`;
-    chip.style.cssText =
+    if (chipEl) return;
+    chipEl = document.createElement('div');
+    chipEl.style.cssText =
       'position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:4px 8px;border-radius:6px;' +
       'background:rgba(17,17,17,.85);color:#fff;font:12px/1.4 system-ui,sans-serif;pointer-events:none;opacity:.8';
-    document.documentElement.appendChild(chip);
+    updateChip();
+    document.documentElement.appendChild(chipEl);
   }
 
   if (document.readyState === 'loading') {
@@ -53,7 +74,7 @@
 
   // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped upload APIs
   const diag = {
-    version: 'v3.0.0',
+    version: 'v3.1.0',
     chunks: 0,
     paced: 0,
     unlimited: 0,
@@ -72,7 +93,7 @@
   // Network speeds use decimal Mbps (1 Mbps = 1,000,000 bits/s = 125 bytes/ms)
   const bytesPerMs = () => (limit.mbps * 1000 * 1000) / 8 / 1000;
 
-  let onQueueWait = null;
+  let scheduleHiddenWait = null;
 
   function drainSliceQueue() {
     if (queueTimer) {
@@ -91,8 +112,11 @@
       const pacingOn = isPacingActive();
       if (pacingOn && now < limit.nextSendAt) {
         const waitMs = Math.max(1, Math.ceil(limit.nextSendAt - now));
-        queueTimer = setTimeout(drainSliceQueue, waitMs);
-        onQueueWait?.();
+        if (document.hidden && scheduleHiddenWait) {
+          scheduleHiddenWait(waitMs);
+        } else {
+          queueTimer = setTimeout(drainSliceQueue, waitMs);
+        }
         return;
       }
       sliceQueue.shift();
@@ -101,12 +125,39 @@
         limit.nextSendAt = Math.max(now, limit.nextSendAt) + item.bytes / bytesPerMs();
       } else {
         diag.unlimited += 1;
-        if (UNLIMITED_IN_BACKGROUND && document.hidden) diag.hiddenUnlimited += 1;
+        if (hiddenMode.enabled && document.hidden) diag.hiddenUnlimited += 1;
         limit.nextSendAt = 0;
       }
+      if (diag.paced <= 3 || diag.paced % 20 === 0) updateChip();
       item.send();
     }
   }
+
+  // Console helper: `kioUploadSpeed(110)` caps upload at 110 Mbps, `kioUploadSpeed(0)` removes the cap
+  win.kioUploadSpeed = function (mbps) {
+    if (mbps === undefined) return limit.mbps;
+    limit.mbps = normalizeMbps(mbps);
+    limit.nextSendAt = 0;
+    try {
+      localStorage.setItem(STORAGE_MBPS_KEY, String(limit.mbps));
+    } catch {}
+    updateChip();
+    drainSliceQueue();
+    return limit.mbps;
+  };
+
+  // Console helper: `kioBackground(true)` lifts the cap while the tab is hidden; default is false (always capped)
+  win.kioBackground = function (enabled) {
+    if (enabled === undefined) return hiddenMode.enabled;
+    hiddenMode.enabled = Boolean(enabled);
+    limit.nextSendAt = 0;
+    try {
+      localStorage.setItem(STORAGE_BG_KEY, String(hiddenMode.enabled));
+    } catch {}
+    updateChip();
+    drainSliceQueue();
+    return hiddenMode.enabled;
+  };
 
   function paceSlice(send, bytes, aborted) {
     diag.chunks += 1;
@@ -132,6 +183,7 @@
   window.__kioUploadOptimizer = {
     version: diag.version,
     limit,
+    hiddenMode,
     diag,
     isPacingActive,
     queueLength: () => sliceQueue.length,
@@ -308,12 +360,17 @@
     } catch {}
   }
 
-  // 2) Smoothly pace duplex ReadableStream uploads when cap is active; switch to native XHR in unlimited/background mode
+  // 2) Smoothly pace duplex ReadableStream uploads when cap is active; switch to native XHR in unlimited mode
   if (typeof window.fetch === 'function') {
     const origFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
       const url = typeof input === 'string' ? input : input?.url || String(input);
-      if (init?.duplex === 'half' && url.includes('/edge/v4/upload') && init.body instanceof ReadableStream) {
+      if (
+        init?.duplex === 'half' &&
+        url.includes('/edge/v4/upload') &&
+        init.body &&
+        typeof init.body.getReader === 'function'
+      ) {
         if (!isPacingActive()) {
           // Rejecting duplex falls back cleanly into kio.ac's Fh (native XMLHttpRequest) for lowest background CPU
           diag.xhrFallbacks += 1;
@@ -523,7 +580,7 @@
     };
   }
 
-  // A tiny Worker keeps its own timer budget, so it can release queued chunks while the tab is hidden.
+  // A tiny Worker keeps its own timer budget, so hidden tabs pace accurately instead of stalling at Chrome's 1s clamp.
   try {
     const bgWorker = new Worker(
       URL.createObjectURL(
@@ -532,14 +589,12 @@
     );
     let bgTickPending = false;
 
-    const askTick = () => {
-      if (!bgTickPending && sliceQueue.length && isPacingActive() && document.hidden) {
+    scheduleHiddenWait = (waitMs) => {
+      if (!bgTickPending) {
         bgTickPending = true;
-        bgWorker.postMessage(200);
+        bgWorker.postMessage(Math.max(1, Math.min(waitMs, 500)));
       }
     };
-
-    onQueueWait = askTick;
 
     bgWorker.onmessage = () => {
       bgTickPending = false;
@@ -547,10 +602,9 @@
     };
 
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden && sliceQueue.length) {
+      if (sliceQueue.length) {
         drainSliceQueue();
       }
-      askTick();
     });
   } catch {}
 
