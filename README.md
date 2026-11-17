@@ -46,6 +46,7 @@
    - Click to install [`Kio_Upload_Optimizer.user.js`](https://raw.githubusercontent.com/ProofPage/Kio-Upload-Optimizer/main/Kio_Upload_Optimizer.user.js).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload. The cap (110 Mbps) and background mode are already on.
+   - Updating from an older version? Reload the `/upload` tab (the script does this once automatically) and restart the upload. Uploads already running keep the old speed.
 
 For Tampermonkey 5.3+ in Chrome-based browsers, enable **Allow User Scripts** in the extension settings (Chrome 138+) or enable **Developer Mode**. See the [official permission instructions](https://www.tampermonkey.net/faq.php?q=Q209).
 

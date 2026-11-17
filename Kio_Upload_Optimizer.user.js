@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.6.0
+// @version      2.6.1
 // @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -18,14 +18,29 @@
 (() => {
   'use strict';
 
+  // Bump on every release so stale in-tab copies notice the upgrade even if the script id changed
+  const SCRIPT_VERSION = '2.6.1';
+
+  // The cap only works on chunks this script realistically sees: 16 MiB chunks at 110 Mbps is one PUT
+  // every ~1.2s, so a page reload is mandatory after updating the script.
+  let booted;
+  try {
+    booted = sessionStorage.getItem('kioUploadOptimizerVersion');
+    sessionStorage.setItem('kioUploadOptimizerVersion', SCRIPT_VERSION);
+  } catch {}
+  if (booted && booted !== SCRIPT_VERSION) {
+    location.reload();
+    return;
+  }
+
+  // A previously installed copy of this userscript would double-wrap the XHR and break the cap
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
 
   // Bandwidth cap: whole chunks are released from one shared queue under a fixed byte window (Mbps, 0 = unlimited)
   const SLICE_BYTES = 16 * 1024 * 1024;
-  const DEFAULT_MBPS = 110;
   // Change these two numbers to tune behaviour; no console command or settings page needed
-  const LIMIT_MBPS = DEFAULT_MBPS; // upload cap in Mbps (0 = no cap)
+  const LIMIT_MBPS = 110; // upload cap in Mbps (0 = no cap)
   const UNLIMITED_IN_BACKGROUND = true; // full speed while the tab is hidden
   const limit = { mbps: LIMIT_MBPS, windowMs: 250, windowStart: 0, windowBytes: 0 };
   // Chrome throttles hidden-tab timers to 1s, so a background tab uses 4x wider windows
@@ -35,7 +50,7 @@
     return limit.mbps > 0 && !(UNLIMITED_IN_BACKGROUND && document.hidden);
   }
 
-  // Tiny on-page status chip so the active mode is visible without opening DevTools
+  // Small status chip: `Kio: 110 Mbps · bg unlimited`, so the active mode is visible without DevTools
   function showModeChip() {
     const chip = document.createElement('div');
     chip.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${
