@@ -43,7 +43,7 @@
    - [Violentmonkey](https://violentmonkey.github.io/) (Recommended)
    - [Tampermonkey](https://www.tampermonkey.net/)
 2. Open the userscript installation URL:
-   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@401844599fa51bf7b58b3aaceacd7331184c57ce/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
+   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@6cdb1378e632c65e79bfe34ac5b17902107a4c05/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload. The cap (110 Mbps) and background mode are already on.
    - Updating from an older version? Reload the `/upload` tab and restart the upload. Uploads already running keep the old speed, because `kio.ac` builds its uploader once per page load.
@@ -59,7 +59,7 @@ Configure these options at [`https://kio.ac/settings`](https://kio.ac/settings) 
 | Setting | Recommended Value | Reason |
 | :--- | :--- | :--- |
 | **Experimental Uploader** | **ON** | Keeps 16 MiB SHA-256 chunk hashing in a background Web Worker (`crypto.subtle`) instead of hashing up to 12 chunks concurrently on the main thread. |
-| **Upload thread** | `1`–`2` | Controls concurrent chunk transfers and browser Blob I/O pressure on high-speed connections. |
+| **Upload thread** (`ul_th`) | `1` (default is `3`) | This is how many chunks the page sends at once. Each one reaches the cap as a burst of up to 16 MiB, so a lower thread count keeps the average close to `110 Mbps` even on a fast line. Default choices are remembered per browser, so a previously saved value stays in effect. |
 
 ---
 
@@ -76,6 +76,17 @@ Configure these options at [`https://kio.ac/settings`](https://kio.ac/settings) 
 | **Realtime Speed Graph** | `requestAnimationFrame` wakes every vsync, redraws canvas at `30fps` | `nextRefresh`/`frameRequestID` loop capped to `1fps` (0fps in background) |
 
 Note: `kio.ac` requires per-chunk `SHA-256` hashes and HTTPS (TLS) transmission, so a single disk read, WebCrypto hashing, and `NetworkService` TLS encryption remain active at network upload speed.
+
+### Checking the cap on a live page
+
+Start an upload and type `__kioUploadOptimizer` in the DevTools console. `diag.paced` counts chunks released through the queue, `diag.unlimited` counts chunks sent at full speed (background or cap `0`), and `diag.hiddenUnlimited` tells you how many of those went out while the tab was hidden.
+
+| What you see | What it means |
+| :--- | :--- |
+| `undefined` | This version of the script is not running in the tab, so reload `/upload`. |
+| `paced` stays `< 2` after a few seconds | The page is not sending through the queue. Turn the experimental uploader off, or the upload went through a path the script does not wrap yet. |
+| `paced` grows fast and the transfer still runs faster than 110 Mbps | The page has more upload threads than the queue can smooth. Set **Upload thread** to `1`. |
+| 0 bytes counted but a transfer is clearly moving | The script was installed after the page loaded. Reload the tab and start the upload again. |
 
 ---
 
