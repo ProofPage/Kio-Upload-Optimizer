@@ -48,6 +48,20 @@
     return limit.mbps > 0 && !(hiddenMode.enabled && document.hidden);
   }
 
+  // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped upload APIs
+  const diag = {
+    version: 'v3.1.0',
+    chunks: 0,
+    paced: 0,
+    unlimited: 0,
+    hiddenUnlimited: 0,
+    aborted: 0,
+    streamedBytes: 0,
+    ramSliceHits: 0,
+    xhrFallbacks: 0,
+    queuedPeak: 0,
+  };
+
   let chipEl = null;
   function updateChip() {
     if (!chipEl) return;
@@ -71,20 +85,6 @@
   } else {
     showModeChip();
   }
-
-  // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped upload APIs
-  const diag = {
-    version: 'v3.1.0',
-    chunks: 0,
-    paced: 0,
-    unlimited: 0,
-    hiddenUnlimited: 0,
-    aborted: 0,
-    streamedBytes: 0,
-    ramSliceHits: 0,
-    xhrFallbacks: 0,
-    queuedPeak: 0,
-  };
 
   // One shared queue paced by nextSendAt, used by both stream batches (256 KiB) and XHR fallback chunks
   const sliceQueue = [];
