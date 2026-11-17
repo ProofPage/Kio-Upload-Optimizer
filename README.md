@@ -44,7 +44,7 @@
    - [Violentmonkey](https://violentmonkey.github.io/) (Recommended)
    - [Tampermonkey](https://www.tampermonkey.net/)
 2. Open the userscript installation URL:
-   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@6cdb1378e632c65e79bfe34ac5b17902107a4c05/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
+   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@4c859c84cd30b691c96e2287d93060b842ce2226/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload. The cap (110 Mbps) and background mode are already on.
    - Updating from an older version? Reload the `/upload` tab and restart the upload. Uploads already running keep the old speed, because `kio.ac` builds its uploader once per page load.
@@ -69,7 +69,7 @@ Configure these options at [`https://kio.ac/settings`](https://kio.ac/settings) 
 | Bottleneck | Original Behavior | Optimization |
 | :--- | :--- | :--- |
 | **Duplicate File/Blob Reads** | Reads each 16 MiB chunk twice via Browser `MojoBlobReader` (hash + upload) | Zero-copy recycles hashed `ArrayBuffer` into `XHR.send(Uint8Array)` (10-chunk LRU) |
-| **Speed Spikes (100–150 Mbps)** | All upload threads send full speed with no shared budget | One 16 MiB-chunk queue paced by a `250ms` byte window, on by default at `110` Mbps |
+| **Speed Spikes (100–150 Mbps)** | All upload threads send full speed with no shared budget | One 16 MiB-chunk queue paced by a shared `nextSendAt` schedule, on by default at `110` Mbps |
 | **Hidden-Tab Stalls** | Chrome clamps hidden timers to 1s, so queueing stops when the tab is backgrounded | Queue released by a dedicated Worker timer, cap lifted automatically in the background |
 | **64 KiB Stream Slicing** | `ReadableStream` copies 16 MiB chunks in 256 × 64 KiB `arrayBuffer()` slices | `Request.prototype.duplex` disabled → native `XMLHttpRequest` upload |
 | **Progress Reactivity Spam** | UI state updated per 64 KiB slice (hundreds–thousands/sec) | `/edge/v4/upload` `onprogress` throttled to `500ms` |
