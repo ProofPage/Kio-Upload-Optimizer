@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.8.0
+// @version      2.9.0
 // @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -22,22 +22,15 @@
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
 
-  // The cap can only average out chunks this large; whole chunks leave one shared queue under a fixed byte window (Mbps, 0 = unlimited)
+  // The cap paces whole chunks through one shared queue (Mbps, 0 = unlimited)
   const SLICE_BYTES = 16 * 1024 * 1024;
-  // Change these two numbers to tune behaviour; no console command or settings page needed
+  // Change these two constants to tune behaviour; no console command or settings page needed
   const LIMIT_MBPS = 110; // upload cap in Mbps (0 = no cap)
-  const UNLIMITED_IN_BACKGROUND = true; // session limit only; a chunk already sent keeps its own rate
-  // Windows are short so a single chunk still spreads over many of them (a 16 MiB chunk = ~466 Mbps in one 250ms window)
-  const limit = { mbps: LIMIT_MBPS, windowMs: 50, windowStart: 0, windowBytes: 0, burstBytes: SLICE_BYTES };
-  // A background tab gets 1s timers and no frame budget, so its byte windows are longer, not its bytes faster
-  const pacingWindowMs = () => (document.hidden ? 1000 : limit.windowMs);
+  const UNLIMITED_IN_BACKGROUND = true; // lift the cap while this tab is hidden
+  const limit = { mbps: LIMIT_MBPS, nextSendAt: 0 };
 
-  // A hidden tab calmly paced would spend minutes on one chunk, so the whole session keeps the speed it started with
-  const sessionUnlimited = UNLIMITED_IN_BACKGROUND && document.hidden;
-
-  // Read per call, and only before a byte window has started: a window that already latched cannot be refunded
   function isPacingActive() {
-    return !sessionUnlimited && limit.mbps > 0;
+    return !(UNLIMITED_IN_BACKGROUND && document.hidden) && limit.mbps > 0;
   }
 
   // Small status chip: shows the hardcoded cap and background mode, no DevTools needed
@@ -58,50 +51,72 @@
   }
 
   // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped XHR
-  const diag = { version: 'v2.8.0', chunks: 0, paced: 0, unlimited: 0, hiddenUnlimited: sessionUnlimited ? 1 : 0, queuedPeak: 0 };
-  window.__kioUploadOptimizer = { version: diag.version, limit, diag, isPacingActive, sessionUnlimited };
+  const diag = {
+    version: 'v2.9.0',
+    chunks: 0,
+    paced: 0,
+    unlimited: 0,
+    hiddenUnlimited: 0,
+    aborted: 0,
+    queuedPeak: 0,
+  };
 
-  // One shared queue paced by the window budget, so chunks never exceed the cap and never go out of order
+  // One shared queue paced by nextSendAt, so concurrent threads share the Mbps cap and never burst together
   const sliceQueue = [];
+  let queueTimer = 0;
+
+  // Network speeds use decimal Mbps (1 Mbps = 1,000,000 bits/s = 125 bytes/ms)
+  const bytesPerMs = () => (limit.mbps * 1000 * 1000) / 8 / 1000;
+
+  let onQueueWait = null;
 
   function drainSliceQueue() {
-    const send = sliceQueue.shift();
-    const sliceBytes = sliceQueue.shift() || SLICE_BYTES;
-    if (!send) return;
-    const now = performance.now();
-    const windowMs = pacingWindowMs();
-    if (!limit.windowStart || now - limit.windowStart >= windowMs) {
-      limit.windowStart = now;
-      limit.windowBytes = 0;
+    if (queueTimer) {
+      clearTimeout(queueTimer);
+      queueTimer = 0;
     }
-    // A whole chunk is the smallest unit: release it, then wait until enough budget has accrued to start the next one
-    limit.burstBytes = sliceBytes;
-    limit.windowBytes += sliceBytes;
-    send();
-    if (sliceQueue.length) {
-      const elapsed = performance.now() - limit.windowStart;
-      const carry = limit.bytesCarry || 0;
-      const overBudget = (limit.windowBytes - budget() + carry) / bytesPerMs();
-      setTimeout(drainSliceQueue, Math.max(1, Math.round(windowMs - elapsed + Math.max(0, overBudget))));
+    while (sliceQueue.length) {
+      const item = sliceQueue[0];
+      if (item.aborted()) {
+        sliceQueue.shift();
+        diag.aborted += 1;
+        continue;
+      }
+      const now = performance.now();
+      const pacingOn = isPacingActive();
+      if (pacingOn && now < limit.nextSendAt) {
+        const waitMs = Math.max(1, Math.ceil(limit.nextSendAt - now));
+        queueTimer = setTimeout(drainSliceQueue, waitMs);
+        onQueueWait?.();
+        return;
+      }
+      sliceQueue.shift();
+      if (pacingOn) {
+        diag.paced += 1;
+        limit.nextSendAt = now + item.bytes / bytesPerMs();
+      } else {
+        diag.unlimited += 1;
+        if (UNLIMITED_IN_BACKGROUND && document.hidden) diag.hiddenUnlimited += 1;
+        limit.nextSendAt = 0;
+      }
+      item.send();
     }
   }
 
-  const bytesPerMs = () => (limit.mbps * 1024 * 1024) / 8 / 1000;
-  const budget = () => ((limit.mbps * 1024 * 1024) / 8) * (pacingWindowMs() / 1000);
-
-  function paceSlice(sendSlice, sliceBytes) {
+  function paceSlice(send, bytes, aborted) {
     diag.chunks += 1;
-    // Not paced: either the session runs unlimited or no byte window has started yet
-    if (sessionUnlimited || !limit.windowStart) {
-      diag.unlimited += 1;
-      sendSlice();
-      return;
-    }
-    diag.paced += 1;
-    sliceQueue.push(sendSlice, sliceBytes);
-    diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length / 2);
-    if (sliceQueue.length === 2) drainSliceQueue();
+    sliceQueue.push({ send, bytes, aborted });
+    diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
+    drainSliceQueue();
   }
+
+  window.__kioUploadOptimizer = {
+    version: diag.version,
+    limit,
+    diag,
+    isPacingActive,
+    queueLength: () => sliceQueue.length,
+  };
 
   // Shared cache to avoid reading each 16 MiB chunk twice (once for SHA-256, once for XHR upload)
   const bufToBlob = new WeakMap();
@@ -288,109 +303,76 @@
     };
   }
 
-  // 3) Pace chunk uploads, reuse hashed buffers (no duplicate Blob read), throttle progress to 500ms
+  // 3) Pace chunk uploads on the original XHR (preserving kio.ac closure state), reuse hashed buffers, throttle progress to 500ms
   if (typeof XMLHttpRequest !== 'undefined') {
     try {
+      const throttledXhrs = new WeakSet();
       const throttledUploads = new WeakSet();
-      const uploadsOf = new Map(); // real XHR -> upload target, since a proxy reports a different `upload`
       const origOpen = XMLHttpRequest.prototype.open;
-      XMLHttpRequest.prototype.open = function (method, url, async) {
+      XMLHttpRequest.prototype.open = function (method, url) {
         try {
-          this.__kioOpen = [method, url, async];
-          this.__kioHeaders = [];
           if (String(url).includes('/edge/v4/upload')) {
+            throttledXhrs.add(this);
             throttledUploads.add(this.upload);
           } else {
+            throttledXhrs.delete(this);
             throttledUploads.delete(this.upload);
           }
-          uploadsOf.set(this, this.upload);
         } catch {}
         return origOpen.apply(this, arguments);
       };
 
-      const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
-      XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-        try {
-          this.__kioHeaders?.push([name, value]);
-        } catch {}
-        return origSetRequestHeader.apply(this, arguments);
+      const origAbort = XMLHttpRequest.prototype.abort;
+      XMLHttpRequest.prototype.abort = function () {
+        this.__kioAborted = true;
+        return origAbort.apply(this, arguments);
       };
 
       const origSend = XMLHttpRequest.prototype.send;
 
-      // kio.ac creates the XHR inside the sender callback, so only here can open() + headers be copied over
-      const startPacedSend = (origin, body) => {
-        const [method, url, async] = origin.__kioOpen;
-        const paced = new XMLHttpRequest();
-        paced.open(method, url, async);
-        paced.responseType = origin.responseType;
-        paced.withCredentials = origin.withCredentials;
-        paced.timeout = origin.timeout;
-        paced.__kioPaced = true;
-
-        for (const [name, value] of origin.__kioHeaders || []) paced.setRequestHeader(name, value);
-
-        for (const prop of [
-          'onloadstart',
-          'onprogress',
-          'onabort',
-          'onerror',
-          'onload',
-          'ontimeout',
-          'onloadend',
-          'onreadystatechange',
-        ]) {
-          paced[prop] = origin[prop];
-        }
-        paced.upload.onprogress = origin.upload.onprogress;
-
-        const cached = body instanceof Blob ? cachedBlobBufs.get(body) : null;
-        const payload = cached && cached.byteLength === body.size ? new Uint8Array(cached) : body;
-        if (payload !== body) paced.__kioCachedBlob = body;
-
-        paced.addEventListener(
-          'loadend',
-          () => {
-            const cachedBody = paced.__kioCachedBlob;
-            if (cachedBody) {
-              paced.__kioCachedBlob = null;
-              if (paced.status >= 200 && paced.status < 300) cachedBlobBufs.delete(cachedBody);
-            }
-          },
-          { once: true },
-        );
-
-        origin.__kioPaced = paced;
-        // Real bytes matter: a short first/last chunk must not be charged as a full 16 MiB one
-        const bytes = payload && typeof payload.byteLength === 'number' ? payload.byteLength : SLICE_BYTES;
-        paceSlice(() => paced.send(payload), bytes);
-      };
-
-      XMLHttpRequest.prototype.send = function (body) {
-        // The page's own proxy resolves get('upload') to the real upload target and calls this send with it
-        if (this instanceof XMLHttpRequest && throttledUploads.has(uploadsOf.get(this)) && limit.mbps > 0) {
-          startPacedSend(this, body);
-          return;
-        }
-
+      function sendWithCachedBuf(xhr, body) {
         if (body instanceof Blob) {
           const cached = cachedBlobBufs.get(body);
           if (cached && cached.byteLength === body.size) {
-            const xhr = this;
             xhr.__kioCachedBlob = body;
             xhr.addEventListener(
               'loadend',
               () => {
+                const cachedBody = xhr.__kioCachedBlob;
                 xhr.__kioCachedBlob = null;
-                if (xhr.status >= 200 && xhr.status < 300) {
-                  cachedBlobBufs.delete(body);
+                if (cachedBody && xhr.status >= 200 && xhr.status < 300) {
+                  cachedBlobBufs.delete(cachedBody);
                 }
               },
               { once: true },
             );
-            return origSend.call(this, new Uint8Array(cached));
+            return origSend.call(xhr, new Uint8Array(cached));
           }
         }
+        return origSend.call(xhr, body);
+      }
+
+      XMLHttpRequest.prototype.send = function (body) {
+        if (throttledXhrs.has(this) && limit.mbps > 0) {
+          const xhr = this;
+          xhr.__kioAborted = false;
+          const bytes =
+            body && typeof body.size === 'number'
+              ? body.size
+              : body && typeof body.byteLength === 'number'
+                ? body.byteLength
+                : SLICE_BYTES;
+          paceSlice(
+            () => {
+              if (!xhr.__kioAborted) sendWithCachedBuf(xhr, body);
+            },
+            bytes,
+            () => Boolean(xhr.__kioAborted),
+          );
+          return;
+        }
+
+        if (body instanceof Blob) return sendWithCachedBuf(this, body);
         return origSend.apply(this, arguments);
       };
 
@@ -415,7 +397,7 @@
                 : null;
           },
           set(fn) {
-            if (typeof fn !== 'function' || !throttledUploads.has(this) || !this.__kioPaced) {
+            if (typeof fn !== 'function' || !throttledUploads.has(this)) {
               originalHandlers.delete(this);
               return origSet.call(this, fn);
             }
@@ -464,16 +446,28 @@
         new Blob(['self.onmessage=e=>setTimeout(()=>self.postMessage(1),e.data);'], { type: 'text/javascript' }),
       ),
     );
+    let bgTickPending = false;
 
     const askTick = () => {
-      if (isPacingActive() && document.hidden) bgWorker.postMessage(250);
+      if (!bgTickPending && sliceQueue.length && isPacingActive() && document.hidden) {
+        bgTickPending = true;
+        bgWorker.postMessage(200);
+      }
     };
 
+    onQueueWait = askTick;
+
     bgWorker.onmessage = () => {
+      bgTickPending = false;
       drainSliceQueue();
-      askTick();
     };
-    document.addEventListener('visibilitychange', askTick);
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && sliceQueue.length) {
+        drainSliceQueue();
+      }
+      askTick();
+    });
   } catch {}
 
   // 5) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)
