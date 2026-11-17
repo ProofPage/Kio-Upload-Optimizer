@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.5.0
+// @version      2.6.0
 // @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -24,52 +24,34 @@
   // Bandwidth cap: whole chunks are released from one shared queue under a fixed byte window (Mbps, 0 = unlimited)
   const SLICE_BYTES = 16 * 1024 * 1024;
   const DEFAULT_MBPS = 110;
-  const limit = { mbps: DEFAULT_MBPS, windowMs: 250, windowStart: 0, windowBytes: 0 };
-  const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  // Change these two numbers to tune behaviour; no console command or settings page needed
+  const LIMIT_MBPS = DEFAULT_MBPS; // upload cap in Mbps (0 = no cap)
+  const UNLIMITED_IN_BACKGROUND = true; // full speed while the tab is hidden
+  const limit = { mbps: LIMIT_MBPS, windowMs: 250, windowStart: 0, windowBytes: 0 };
   // Chrome throttles hidden-tab timers to 1s, so a background tab uses 4x wider windows
   const pacingWindowMs = () => (document.hidden ? limit.windowMs * 4 : limit.windowMs);
 
-  function applyMbps(mbps) {
-    const value = Number(mbps);
-    limit.mbps = Number.isFinite(value) && value > 0 ? Math.min(value, 2000) : 0;
-  }
-
-  try {
-    chrome.storage.local.get('kio_upload_mbps', (res) => {
-      if (res && 'kio_upload_mbps' in res) applyMbps(res.kio_upload_mbps);
-      else applyMbps(DEFAULT_MBPS);
-    });
-  } catch {}
-
-  // Console helper: `kioUploadSpeed(80)` caps the upload at 80 Mbps, `kioUploadSpeed(0)` removes the cap
-  win.kioUploadSpeed = function (mbps) {
-    applyMbps(mbps);
-    try {
-      chrome.storage.local.set({ kio_upload_mbps: limit.mbps });
-    } catch {}
-    return limit.mbps;
-  };
-
-  // Background upload mode: skips the queue so a hidden tab is not slowed by Chrome's 1s timer throttle
-  const hiddenMode = { enabled: false };
-  try {
-    chrome.storage.local.get('kio_bg_unrestricted', (res) => {
-      if (res && typeof res.kio_bg_unrestricted === 'boolean') hiddenMode.enabled = res.kio_bg_unrestricted;
-    });
-  } catch {}
-
   function isPacingActive() {
-    return limit.mbps > 0 && !(hiddenMode.enabled && document.hidden);
+    return limit.mbps > 0 && !(UNLIMITED_IN_BACKGROUND && document.hidden);
   }
 
-  // Console helper: `kioBackground(true)` uploads at full speed while the tab is hidden
-  win.kioBackground = function (enabled) {
-    hiddenMode.enabled = Boolean(enabled);
-    try {
-      chrome.storage.local.set({ kio_bg_unrestricted: hiddenMode.enabled });
-    } catch {}
-    return hiddenMode.enabled;
-  };
+  // Tiny on-page status chip so the active mode is visible without opening DevTools
+  function showModeChip() {
+    const chip = document.createElement('div');
+    chip.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${
+      UNLIMITED_IN_BACKGROUND ? ' · bg unlimited' : ''
+    }`;
+    chip.style.cssText =
+      'position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:4px 8px;border-radius:6px;' +
+      'background:rgba(17,17,17,.85);color:#fff;font:12px/1.4 system-ui,sans-serif;pointer-events:none;opacity:.8';
+    document.documentElement.appendChild(chip);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', showModeChip, { once: true });
+  } else {
+    showModeChip();
+  }
 
   // One shared queue paced by the window budget, so chunks never exceed the cap and never go out of order
   const sliceQueue = [];
