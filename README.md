@@ -10,22 +10,18 @@
 ## Key Features
 
 - **Single-Read Chunk Reuse (No Duplicate Disk/Blob I/O)**:
-  - Normally `kio.ac` reads every 16 MiB chunk twice through Chrome's Browser process (`Blob` IPC): once to compute `SHA-256` inside `streaming-worker`, and a second time when uploading the `Blob`.
-  - Transfers the already-hashed `ArrayBuffer` back from `streaming-worker` (zero-copy) and feeds it directly to `XMLHttpRequest.send(Uint8Array)` (bounded LRU cache, max 10 chunks), cutting Chrome Browser process Blob I/O in half with automatic fallback to normal `Blob` reads.
+  - Normally `kio.ac` reads every 16 MiB chunk twice through Chrome's Browser process (`Blob` IPC): once to compute `SHA-256` inside `streaming-worker`, and a second time when uploading the `Blob` (or 256 × 64 KiB `ReadableStream` slices).
+  - Transfers the already-hashed `ArrayBuffer` back from `streaming-worker` (zero-copy, bounded 10-chunk LRU cache) and serves both 64 KiB stream slices (capped foreground) and `XMLHttpRequest.send(Uint8Array)` (unlimited/background) directly from RAM with automatic fallback to normal `Blob` reads.
 
-- **Native `XMLHttpRequest` Direct Transfers**:
-  - Disables the `fetch` `duplex: "half"` capability probe so `kio.ac` automatically uses its built-in `XMLHttpRequest` fallback instead of slicing every 16 MiB chunk into 256 × 64 KiB `ReadableStream` `arrayBuffer()` reads in JavaScript.
-  - Includes a `/edge/v4/upload` `fetch` guard so streaming uploads never fall back into the 64 KiB slicing loop.
-
-- **Upload Speed Cap (110 Mbps by default)**:
+- **Smooth Upload Speed Cap (110 Mbps by default) + Native XHR in Unlimited Mode**:
   - Works as installed: the cap is **110 Mbps** and no console command or settings page is needed. The current mode is shown in a small chip at the bottom-right of the page.
   - To change it, edit the single `LIMIT_MBPS` constant near the top of the script in your userscript manager (`0` = no cap).
-  - Chunks are released from a single shared queue, so concurrent upload threads cannot exceed the cap together and chunks are never sent out of order. Each chunk still travels as one `PUT`, so server-side hash checks and retries keep working.
-  - The queue holds back a whole 16 MiB chunk, so the queue alone cannot beat the cap. What the cap cannot do is split a chunk: once one is on the wire it finishes at whatever the line allows. On a gigabit-class connection a single 16 MiB `PUT` lasts only a second or two, so the rate you read during an upload still spikes. Splitting a chunk would mean streaming it to the edge so padding can be added before hashing, which breaks if the two codecs race, so the script keeps whole chunks.
+  - While the cap is active in the foreground, each `/edge/v4/upload` `ReadableStream` is paced in `256 KiB` batches through a single shared byte-budget queue (~19 ms per batch across all upload threads), keeping real-time speed steady at ~110 Mbps without 16 MiB network bursts.
+  - When unlimited (`LIMIT_MBPS = 0` or background tab with `UNLIMITED_IN_BACKGROUND = true`), `fetch` `duplex: "half"` is rejected so `kio.ac` falls back to single-`PUT` native `XMLHttpRequest` for lowest CPU usage.
 
 - **Background Upload Support**:
-  - Chrome clamps hidden-tab timers to 1 second and suspends `requestAnimationFrame`, which stalls the chunk queue once the tab is hidden. The queue is now driven by a tiny dedicated Worker that keeps its own timer budget, so uploads continue while you work in another tab.
-  - While the tab is hidden the cap is lifted automatically (`UNLIMITED_IN_BACKGROUND = true`) so the upload finishes at full speed. Set it to `false` in the script to keep the Mbps limit everywhere.
+  - Chrome clamps hidden-tab timers to 1 second and suspends `requestAnimationFrame`, which stalls paced queues once the tab is hidden.
+  - By default (`UNLIMITED_IN_BACKGROUND = true`), switching away from the tab lifts the cap immediately and switches new chunks to native `XMLHttpRequest` at full speed. Set it to `false` in the script to keep the Mbps limit everywhere via the built-in Worker timer.
 
 - **Progress UI Update Throttling**:
   - Throttles `/edge/v4/upload` `XMLHttpRequest.upload.onprogress` callbacks to `500ms` intervals (matching `kio.ac`'s internal 500ms speed meter) while always forwarding final completion bytes immediately, cutting Svelte reactive DOM updates without affecting transferred byte accuracy.
@@ -44,7 +40,7 @@
    - [Violentmonkey](https://violentmonkey.github.io/) (Recommended)
    - [Tampermonkey](https://www.tampermonkey.net/)
 2. Open the userscript installation URL:
-   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@4c859c84cd30b691c96e2287d93060b842ce2226/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
+   - Click to install [`Kio_Upload_Optimizer.user.js`](https://cdn.jsdelivr.net/gh/ProofPage/Kio-Upload-Optimizer@00c633d3f79f254b0d8631de65d247fcc53c76f7/Kio_Upload_Optimizer.user.js) (jsDelivr, pinned to a commit so the exact published version is served; `@updateURL` keeps the moving `@main` alias).
 3. Confirm the installation prompt in your userscript manager.
 4. Refresh `https://kio.ac/upload` before starting a new upload. The cap (110 Mbps) and background mode are already on.
    - Updating from an older version? Reload the `/upload` tab and restart the upload. Uploads already running keep the old speed, because `kio.ac` builds its uploader once per page load.
@@ -68,10 +64,10 @@ Configure these options at [`https://kio.ac/settings`](https://kio.ac/settings) 
 
 | Bottleneck | Original Behavior | Optimization |
 | :--- | :--- | :--- |
-| **Duplicate File/Blob Reads** | Reads each 16 MiB chunk twice via Browser `MojoBlobReader` (hash + upload) | Zero-copy recycles hashed `ArrayBuffer` into `XHR.send(Uint8Array)` (10-chunk LRU) |
-| **Speed Spikes (100–150 Mbps)** | All upload threads send full speed with no shared budget | One 16 MiB-chunk queue paced by a shared `nextSendAt` schedule, on by default at `110` Mbps |
-| **Hidden-Tab Stalls** | Chrome clamps hidden timers to 1s, so queueing stops when the tab is backgrounded | Queue released by a dedicated Worker timer, cap lifted automatically in the background |
-| **64 KiB Stream Slicing** | `ReadableStream` copies 16 MiB chunks in 256 × 64 KiB `arrayBuffer()` slices | `Request.prototype.duplex` disabled → native `XMLHttpRequest` upload |
+| **Duplicate File/Blob Reads** | Reads each 16 MiB chunk twice via Browser `MojoBlobReader` (hash + upload) | Zero-copy recycles hashed `ArrayBuffer` into RAM slice cache & `XHR.send(Uint8Array)` (10-chunk LRU) |
+| **Speed Spikes (190+ Mbps)** | All upload threads send full speed or burst 16 MiB chunks | Shared `256 KiB` stream queue (`~19ms` turns across threads) keeps speed steady at `110` Mbps |
+| **Hidden-Tab Stalls** | Chrome clamps hidden timers to 1s, so queueing stops when the tab is backgrounded | Cap lifted automatically in background (`XMLHttpRequest`), or paced via dedicated Worker timer |
+| **64 KiB Disk Slice IPC** | `ReadableStream` issues 256 × `MojoBlobReader` IPC calls per chunk | `Blob.slice` reads served from cached `ArrayBuffer` in RAM; unlimited mode uses native `XMLHttpRequest` |
 | **Progress Reactivity Spam** | UI state updated per 64 KiB slice (hundreds–thousands/sec) | `/edge/v4/upload` `onprogress` throttled to `500ms` |
 | **Streaming Loop Spin** | `scheduler.postTask(() => {}, { priority: "user-visible" })` 0ms loop | Empty yield tasks paced to `50ms` (`250ms` in background) |
 | **Realtime Speed Graph** | `requestAnimationFrame` wakes every vsync, redraws canvas at `30fps` | `nextRefresh`/`frameRequestID` loop capped to `1fps` (0fps in background) |
