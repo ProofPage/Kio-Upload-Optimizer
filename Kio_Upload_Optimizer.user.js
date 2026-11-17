@@ -18,21 +18,6 @@
 (() => {
   'use strict';
 
-  // Bump on every release so stale in-tab copies notice the upgrade even if the script id changed
-  const SCRIPT_VERSION = '2.6.1';
-
-  // The cap only works on chunks this script realistically sees: 16 MiB chunks at 110 Mbps is one PUT
-  // every ~1.2s, so a page reload is mandatory after updating the script.
-  let booted;
-  try {
-    booted = sessionStorage.getItem('kioUploadOptimizerVersion');
-    sessionStorage.setItem('kioUploadOptimizerVersion', SCRIPT_VERSION);
-  } catch {}
-  if (booted && booted !== SCRIPT_VERSION) {
-    location.reload();
-    return;
-  }
-
   // A previously installed copy of this userscript would double-wrap the XHR and break the cap
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
@@ -50,7 +35,7 @@
     return limit.mbps > 0 && !(UNLIMITED_IN_BACKGROUND && document.hidden);
   }
 
-  // Small status chip: `Kio: 110 Mbps · bg unlimited`, so the active mode is visible without DevTools
+  // Small status chip: shows the hardcoded cap and background mode, no DevTools needed
   function showModeChip() {
     const chip = document.createElement('div');
     chip.textContent = `Kio: ${limit.mbps ? `${limit.mbps} Mbps` : 'unlimited'}${
