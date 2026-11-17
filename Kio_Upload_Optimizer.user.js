@@ -478,7 +478,8 @@
     document.addEventListener('visibilitychange', askTick);
   } catch {}
 
-  // 5) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)  const origRAF = window.requestAnimationFrame?.bind(window);
+  // 5) Cap chartjs-plugin-streaming rAF redraws on /upload to 1fps (matching 1000ms data refresh)
+  const origRAF = window.requestAnimationFrame?.bind(window);
   const origCancelRAF = window.cancelAnimationFrame?.bind(window);
   if (origRAF && origCancelRAF) {
     const chartTimers = new Map();
