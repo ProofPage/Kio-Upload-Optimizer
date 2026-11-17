@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.9.0
-// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
+// @version      3.0.0
+// @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, smoothly pacing upload Mbps without 16 MiB bursts, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -18,12 +18,13 @@
 (() => {
   'use strict';
 
-  // A previously installed copy of this userscript would double-wrap the XHR and break the cap
+  // A previously installed copy of this userscript would double-wrap the hooks and break the cap
   if (window.__kioUploadOptimizerLoaded) return;
   window.__kioUploadOptimizerLoaded = true;
 
-  // The cap paces whole chunks through one shared queue (Mbps, 0 = unlimited)
+  // The cap paces 256 KiB batches across all concurrent streams so speed stays smooth at LIMIT_MBPS without 16 MiB bursts
   const SLICE_BYTES = 16 * 1024 * 1024;
+  const STREAM_BATCH_BYTES = 256 * 1024;
   // Change these two constants to tune behaviour; no console command or settings page needed
   const LIMIT_MBPS = 110; // upload cap in Mbps (0 = no cap)
   const UNLIMITED_IN_BACKGROUND = true; // lift the cap while this tab is hidden
@@ -50,18 +51,21 @@
     showModeChip();
   }
 
-  // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped XHR
+  // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped upload APIs
   const diag = {
-    version: 'v2.9.0',
+    version: 'v3.0.0',
     chunks: 0,
     paced: 0,
     unlimited: 0,
     hiddenUnlimited: 0,
     aborted: 0,
+    streamedBytes: 0,
+    ramSliceHits: 0,
+    xhrFallbacks: 0,
     queuedPeak: 0,
   };
 
-  // One shared queue paced by nextSendAt, so concurrent threads share the Mbps cap and never burst together
+  // One shared queue paced by nextSendAt, used by both stream batches (256 KiB) and XHR fallback chunks
   const sliceQueue = [];
   let queueTimer = 0;
 
@@ -80,6 +84,7 @@
       if (item.aborted()) {
         sliceQueue.shift();
         diag.aborted += 1;
+        item.onAbort?.();
         continue;
       }
       const now = performance.now();
@@ -93,7 +98,7 @@
       sliceQueue.shift();
       if (pacingOn) {
         diag.paced += 1;
-        limit.nextSendAt = now + item.bytes / bytesPerMs();
+        limit.nextSendAt = Math.max(now, limit.nextSendAt) + item.bytes / bytesPerMs();
       } else {
         diag.unlimited += 1;
         if (UNLIMITED_IN_BACKGROUND && document.hidden) diag.hiddenUnlimited += 1;
@@ -110,6 +115,20 @@
     drainSliceQueue();
   }
 
+  // Reserve a byte-budget turn for a stream batch; resolves even on abort so pull() can exit cleanly
+  function waitStreamTurn(bytes, isAborted) {
+    return new Promise((resolve) => {
+      sliceQueue.push({
+        bytes,
+        aborted: isAborted,
+        send: resolve,
+        onAbort: resolve,
+      });
+      diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
+      drainSliceQueue();
+    });
+  }
+
   window.__kioUploadOptimizer = {
     version: diag.version,
     limit,
@@ -118,8 +137,9 @@
     queueLength: () => sliceQueue.length,
   };
 
-  // Shared cache to avoid reading each 16 MiB chunk twice (once for SHA-256, once for XHR upload)
+  // Shared cache to avoid reading each 16 MiB chunk twice (once for SHA-256, once for upload)
   const bufToBlob = new WeakMap();
+  const sliceMeta = new WeakMap();
   const cachedBlobBufs = new Map();
   const MAX_CACHED_CHUNKS = 10; // <= 160 MiB cap
 
@@ -132,11 +152,37 @@
     }
   }
 
-  // 1) Track large chunk Blob -> ArrayBuffer reads and recycle hashed buffers from streaming-worker
+  // 1) Track large chunk Blob -> ArrayBuffer reads, recycle hashed buffers, and serve 64 KiB stream slices from RAM
+  if (typeof Blob !== 'undefined' && typeof Blob.prototype.slice === 'function') {
+    const origSlice = Blob.prototype.slice;
+    Blob.prototype.slice = function (start, end) {
+      const sliced = origSlice.apply(this, arguments);
+      try {
+        if (cachedBlobBufs.has(this)) {
+          const size = this.size;
+          const relStart = start == null ? 0 : Number(start);
+          const s = relStart < 0 ? Math.max(size + relStart, 0) : Math.min(relStart, size);
+          const relEnd = end == null ? size : Number(end);
+          const e = relEnd < 0 ? Math.max(size + relEnd, 0) : Math.min(relEnd, size);
+          if (e >= s) sliceMeta.set(sliced, { parent: this, start: s, end: e });
+        }
+      } catch {}
+      return sliced;
+    };
+  }
+
   if (typeof Blob !== 'undefined' && typeof Blob.prototype.arrayBuffer === 'function') {
     const origArrayBuffer = Blob.prototype.arrayBuffer;
     Blob.prototype.arrayBuffer = function () {
       const blob = this;
+      const meta = sliceMeta.get(blob);
+      if (meta) {
+        const cached = cachedBlobBufs.get(meta.parent);
+        if (cached && meta.end <= cached.byteLength) {
+          diag.ramSliceHits += 1;
+          return Promise.resolve(cached.slice(meta.start, meta.end));
+        }
+      }
       return origArrayBuffer.call(blob).then((buf) => {
         if (buf && buf.byteLength >= 1024 * 1024) {
           bufToBlob.set(buf, blob);
@@ -262,42 +308,80 @@
     } catch {}
   }
 
-  // 2) Force native XMLHttpRequest uploads instead of 64 KiB ReadableStream slicing
-  if (typeof Request !== 'undefined') {
-    try {
-      const desc = Object.getOwnPropertyDescriptor(Request.prototype, 'duplex');
-      if (!desc || desc.configurable) {
-        Object.defineProperty(Request.prototype, 'duplex', {
-          get() {
-            return undefined;
-          },
-          configurable: true,
-        });
-      }
-    } catch {}
-
-    try {
-      const OrigRequest = window.Request;
-      window.Request = new Proxy(OrigRequest, {
-        construct(target, args) {
-          if (args[0] === '/' && args[1]?.duplex === 'half') {
-            throw new TypeError('duplex probe disabled');
-          }
-          return new target(...args);
-        },
-      });
-    } catch {}
-  }
-
+  // 2) Smoothly pace duplex ReadableStream uploads when cap is active; switch to native XHR in unlimited/background mode
   if (typeof window.fetch === 'function') {
     const origFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
       const url = typeof input === 'string' ? input : input?.url || String(input);
-      if (init?.duplex === 'half' && url.includes('/edge/v4/upload')) {
-        try {
-          Promise.resolve(init.body?.cancel?.()).catch(() => {});
-        } catch {}
-        return Promise.reject(new TypeError('duplex disabled'));
+      if (init?.duplex === 'half' && url.includes('/edge/v4/upload') && init.body instanceof ReadableStream) {
+        if (!isPacingActive()) {
+          // Rejecting duplex falls back cleanly into kio.ac's Fh (native XMLHttpRequest) for lowest background CPU
+          diag.xhrFallbacks += 1;
+          try {
+            Promise.resolve(init.body.cancel?.()).catch(() => {});
+          } catch {}
+          return Promise.reject(new TypeError('duplex disabled in unlimited mode'));
+        }
+
+        const sourceStream = init.body;
+        const reader = sourceStream.getReader();
+        const signal = init.signal;
+        let cancelled = false;
+        let carry = null;
+
+        const pacedStream = new ReadableStream({
+          async pull(controller) {
+            if (cancelled || signal?.aborted) {
+              try {
+                await reader.cancel();
+              } catch {}
+              controller.close();
+              return;
+            }
+
+            if (isPacingActive()) {
+              await waitStreamTurn(STREAM_BATCH_BYTES, () => cancelled || Boolean(signal?.aborted));
+            }
+            if (cancelled || signal?.aborted) {
+              try {
+                await reader.cancel();
+              } catch {}
+              controller.close();
+              return;
+            }
+
+            let emitted = 0;
+            if (carry) {
+              controller.enqueue(carry);
+              emitted += carry.byteLength;
+              diag.streamedBytes += carry.byteLength;
+              carry = null;
+            }
+
+            while (emitted < STREAM_BATCH_BYTES) {
+              const { done, value } = await reader.read();
+              if (done) {
+                controller.close();
+                return;
+              }
+              if (value && value.byteLength) {
+                if (emitted + value.byteLength > STREAM_BATCH_BYTES && emitted > 0) {
+                  carry = value;
+                  return;
+                }
+                controller.enqueue(value);
+                emitted += value.byteLength;
+                diag.streamedBytes += value.byteLength;
+              }
+            }
+          },
+          cancel(reason) {
+            cancelled = true;
+            return reader.cancel(reason).catch(() => {});
+          },
+        });
+
+        return origFetch(input, { ...init, body: pacedStream });
       }
       return origFetch(input, init);
     };
