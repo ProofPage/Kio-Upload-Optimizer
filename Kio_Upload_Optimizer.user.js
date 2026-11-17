@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      2.7.0
+// @version      2.8.0
 // @description  Eliminates upload CPU spikes on kio.ac by avoiding duplicate file reads, forcing native XHR transfers, capping upload Mbps, throttling progress UI updates, removing 0ms busy-wait loops, and capping chart redraws.
 // @author       Page
 // @match        https://kio.ac/*
@@ -28,7 +28,7 @@
   const LIMIT_MBPS = 110; // upload cap in Mbps (0 = no cap)
   const UNLIMITED_IN_BACKGROUND = true; // session limit only; a chunk already sent keeps its own rate
   // Windows are short so a single chunk still spreads over many of them (a 16 MiB chunk = ~466 Mbps in one 250ms window)
-  const limit = { mbps: LIMIT_MBPS, windowMs: 50, windowStart: 0, windowBytes: 0 };
+  const limit = { mbps: LIMIT_MBPS, windowMs: 50, windowStart: 0, windowBytes: 0, burstBytes: SLICE_BYTES };
   // A background tab gets 1s timers and no frame budget, so its byte windows are longer, not its bytes faster
   const pacingWindowMs = () => (document.hidden ? 1000 : limit.windowMs);
 
@@ -58,7 +58,7 @@
   }
 
   // Probe, so an unlimited run can be told apart from a script that never loaded or never wrapped XHR
-  const diag = { version: 'v2.7.0', chunks: 0, paced: 0, unlimited: 0, hiddenUnlimited: sessionUnlimited ? 1 : 0, queuedPeak: 0 };
+  const diag = { version: 'v2.8.0', chunks: 0, paced: 0, unlimited: 0, hiddenUnlimited: sessionUnlimited ? 1 : 0, queuedPeak: 0 };
   window.__kioUploadOptimizer = { version: diag.version, limit, diag, isPacingActive, sessionUnlimited };
 
   // One shared queue paced by the window budget, so chunks never exceed the cap and never go out of order
@@ -66,6 +66,7 @@
 
   function drainSliceQueue() {
     const send = sliceQueue.shift();
+    const sliceBytes = sliceQueue.shift() || SLICE_BYTES;
     if (!send) return;
     const now = performance.now();
     const windowMs = pacingWindowMs();
@@ -74,11 +75,13 @@
       limit.windowBytes = 0;
     }
     // A whole chunk is the smallest unit: release it, then wait until enough budget has accrued to start the next one
-    limit.windowBytes += SLICE_BYTES;
+    limit.burstBytes = sliceBytes;
+    limit.windowBytes += sliceBytes;
     send();
     if (sliceQueue.length) {
       const elapsed = performance.now() - limit.windowStart;
-      const overBudget = (limit.windowBytes - budget()) / bytesPerMs();
+      const carry = limit.bytesCarry || 0;
+      const overBudget = (limit.windowBytes - budget() + carry) / bytesPerMs();
       setTimeout(drainSliceQueue, Math.max(1, Math.round(windowMs - elapsed + Math.max(0, overBudget))));
     }
   }
@@ -86,7 +89,7 @@
   const bytesPerMs = () => (limit.mbps * 1024 * 1024) / 8 / 1000;
   const budget = () => ((limit.mbps * 1024 * 1024) / 8) * (pacingWindowMs() / 1000);
 
-  function paceSlice(sendSlice) {
+  function paceSlice(sendSlice, sliceBytes) {
     diag.chunks += 1;
     // Not paced: either the session runs unlimited or no byte window has started yet
     if (sessionUnlimited || !limit.windowStart) {
@@ -95,9 +98,9 @@
       return;
     }
     diag.paced += 1;
-    sliceQueue.push(sendSlice);
-    diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length);
-    if (sliceQueue.length === 1) drainSliceQueue();
+    sliceQueue.push(sendSlice, sliceBytes);
+    diag.queuedPeak = Math.max(diag.queuedPeak, sliceQueue.length / 2);
+    if (sliceQueue.length === 2) drainSliceQueue();
   }
 
   // Shared cache to avoid reading each 16 MiB chunk twice (once for SHA-256, once for XHR upload)
@@ -289,6 +292,7 @@
   if (typeof XMLHttpRequest !== 'undefined') {
     try {
       const throttledUploads = new WeakSet();
+      const uploadsOf = new Map(); // real XHR -> upload target, since a proxy reports a different `upload`
       const origOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function (method, url, async) {
         try {
@@ -299,6 +303,7 @@
           } else {
             throttledUploads.delete(this.upload);
           }
+          uploadsOf.set(this, this.upload);
         } catch {}
         return origOpen.apply(this, arguments);
       };
@@ -356,31 +361,16 @@
         );
 
         origin.__kioPaced = paced;
-        paceSlice(() => paced.send(payload));
+        // Real bytes matter: a short first/last chunk must not be charged as a full 16 MiB one
+        const bytes = payload && typeof payload.byteLength === 'number' ? payload.byteLength : SLICE_BYTES;
+        paceSlice(() => paced.send(payload), bytes);
       };
 
-      // Page code checks readyState and attaches listeners after send(), so it keeps seeing the real request
-      function proxyXhr(origin) {
-        return new Proxy(origin, {
-          get(target, prop) {
-            if (prop === 'send') return (body) => startPacedSend(target, body);
-            const source = target.__kioPaced || target;
-            const value = prop === 'upload' ? source.upload : source[prop];
-            return typeof value === 'function' ? value.bind(source) : value;
-          },
-          set(target, prop, value) {
-            const source = target.__kioPaced || target;
-            if (prop in source) source[prop] = value;
-            return true;
-          },
-        });
-      }
-
       XMLHttpRequest.prototype.send = function (body) {
-        if (throttledUploads.has(this.upload) && limit.mbps > 0) {
-          const xhr = proxyXhr(this);
-          xhr.send(body);
-          return xhr;
+        // The page's own proxy resolves get('upload') to the real upload target and calls this send with it
+        if (this instanceof XMLHttpRequest && throttledUploads.has(uploadsOf.get(this)) && limit.mbps > 0) {
+          startPacedSend(this, body);
+          return;
         }
 
         if (body instanceof Blob) {
