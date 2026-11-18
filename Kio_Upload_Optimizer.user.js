@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.1.0
-// @description  Eliminates CPU, memory, and disk I/O bottlenecks on kio.ac across uploads (zero-copy worker chunk reuse, native XHR transfers, progress & chart rAF throttling, 0ms postTask pacing) and collection downloads (shared 500ms speed ticker, BroadcastChannel & countdown rAF throttling) without triggering Ad-Shield or OOMs.
+// @version      5.2.0
+// @description  Eliminates CPU, timer, and stream-slicing overhead on kio.ac with zero extra RAM usage (native Blob XHR uploads without 64 KiB stream slicing, 500ms progress throttling, 0ms postTask pacing, 1fps chart rAF cap, shared 500ms speed ticker, BroadcastChannel & countdown rAF throttling).
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -22,13 +22,13 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.1.0',
-    reusedBufs: 0,
-    blobFallbacks: 0,
+    version: 'v5.2.0',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
     speedTimersCoalesced: 0,
+    speedTimersAutoFreed: 0,
+    fileObjectUrlsSkipped: 0,
     bcThrottled: 0,
     countdownRafCapped: 0,
   };
@@ -37,7 +37,7 @@
   function showModeChip() {
     if (!document.documentElement) return;
     const chip = document.createElement('div');
-    chip.textContent = 'Kio: CPU & I/O Optimized';
+    chip.textContent = 'Kio: CPU & Memory Optimized';
     chip.style.cssText =
       'position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:4px 8px;border-radius:6px;' +
       'background:rgba(17,17,17,.85);color:#fff;font:12px/1.4 system-ui,sans-serif;pointer-events:none;opacity:.75';
@@ -50,179 +50,38 @@
     showModeChip();
   }
 
-  // Strictly bounded (<= 96 MiB / 6 chunks) zero-copy cache exclusively for active streaming-worker chunks.
-  // Never caches arbitrary Blob.arrayBuffer() calls, eliminating OOMs on large files and LegacyUploader.
-  const bufToBlob = new WeakMap();
-  const cachedBlobBufs = new Map();
-  const MAX_CACHEABLE_CHUNK_BYTES = 16 * 1024 * 1024 + 4096;
-  const MAX_CACHED_BYTES = 96 * 1024 * 1024;
-  const MAX_CACHED_CHUNKS = 6;
-  let cachedTotalBytes = 0;
+  // 1) Prevent Jn.fromFile(file) from pinning every selected upload File in URL.createObjectURL()'s global Blob URL table
+  if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' && typeof File !== 'undefined') {
+    const origCreateObjectURL = URL.createObjectURL.bind(URL);
+    let tinyPlaceholderBlob = null;
 
-  function deleteCachedBuf(blob) {
-    const entry = cachedBlobBufs.get(blob);
-    if (!entry) return false;
-    cachedBlobBufs.delete(blob);
-    cachedTotalBytes = Math.max(0, cachedTotalBytes - entry.bytes);
-    return true;
-  }
-
-  function clearCachedBufs() {
-    cachedBlobBufs.clear();
-    cachedTotalBytes = 0;
-  }
-
-  function setCachedBuf(blob, buf) {
-    if (!blob || !(buf instanceof ArrayBuffer) || buf.byteLength === 0 || buf.byteLength > MAX_CACHEABLE_CHUNK_BYTES) {
-      return;
-    }
-    deleteCachedBuf(blob);
-    while (
-      cachedBlobBufs.size > 0 &&
-      (cachedBlobBufs.size >= MAX_CACHED_CHUNKS || cachedTotalBytes + buf.byteLength > MAX_CACHED_BYTES)
-    ) {
-      const oldest = cachedBlobBufs.keys().next().value;
-      deleteCachedBuf(oldest);
-    }
-    cachedBlobBufs.set(blob, { buf, bytes: buf.byteLength });
-    cachedTotalBytes += buf.byteLength;
-  }
-
-  window.addEventListener('pagehide', clearCachedBufs);
-
-  // 1) Tag chunk ArrayBuffers with a WeakMap reference (zero memory overhead) and recycle from streaming-worker
-  if (typeof Blob !== 'undefined' && typeof Blob.prototype.arrayBuffer === 'function') {
-    const origArrayBuffer = Blob.prototype.arrayBuffer;
-    Blob.prototype.arrayBuffer = function () {
-      const blob = this;
-      return origArrayBuffer.call(blob).then((buf) => {
-        if (buf && buf.byteLength > 0 && buf.byteLength <= MAX_CACHEABLE_CHUNK_BYTES) {
-          bufToBlob.set(buf, blob);
-        }
-        return buf;
-      });
+    URL.createObjectURL = function (obj) {
+      if (
+        obj instanceof File &&
+        obj.size > 1024 * 1024 &&
+        (location.pathname.startsWith('/upload') || location.pathname.startsWith('/c/'))
+      ) {
+        try {
+          if (!tinyPlaceholderBlob) {
+            tinyPlaceholderBlob = new Blob([]);
+          }
+          const url = origCreateObjectURL(tinyPlaceholderBlob);
+          setTimeout(() => {
+            try {
+              URL.revokeObjectURL(url);
+            } catch {}
+          }, 0);
+          diag.fileObjectUrlsSkipped += 1;
+          return url;
+        } catch {}
+      }
+      return origCreateObjectURL(obj);
     };
   }
 
-  if (typeof window.Worker === 'function') {
-    try {
-      const OrigWorker = window.Worker;
-      window.Worker = new Proxy(OrigWorker, {
-        construct(target, args) {
-          const rawUrl = args[0] instanceof URL ? args[0].href : String(args[0] || '');
-          const opts = args[1];
-          if (!rawUrl.includes('streaming-worker') || opts?.type !== 'module') {
-            return new target(...args);
-          }
-
-          const shimCode = `
-            const inflight = new Map();
-            const origPost = self.postMessage.bind(self);
-            const origAdd = self.addEventListener.bind(self);
-            let workerMsgHandler = null;
-            const queued = [];
-
-            origAdd('message', (ev) => {
-              const d = ev.data;
-              if (d && typeof d.id === 'string' && d.chunk instanceof ArrayBuffer) {
-                inflight.set(d.id, d.chunk);
-              }
-              if (workerMsgHandler) {
-                workerMsgHandler(ev);
-              } else {
-                queued.push(ev);
-              }
-            });
-
-            self.addEventListener = function (type, fn, options) {
-              if (type === 'message' && typeof fn === 'function' && !workerMsgHandler) {
-                workerMsgHandler = fn;
-                while (queued.length) fn(queued.shift());
-                return;
-              }
-              return origAdd(type, fn, options);
-            };
-
-            self.postMessage = function (msg, transfer) {
-              if (msg && typeof msg.id === 'string') {
-                const chunk = inflight.get(msg.id);
-                inflight.delete(msg.id);
-                if (chunk && msg.success && !msg.exists) {
-                  const xfer = Array.isArray(transfer) ? [...transfer, chunk] : [chunk];
-                  msg.__kioChunk = chunk;
-                  return origPost(msg, xfer);
-                }
-              }
-              return origPost(msg, transfer);
-            };
-
-            await import(${JSON.stringify(rawUrl)});
-          `;
-
-          let worker;
-          let shimUrl = null;
-          try {
-            shimUrl = URL.createObjectURL(new Blob([shimCode], { type: 'text/javascript' }));
-            worker = new target(shimUrl, opts);
-            setTimeout(() => URL.revokeObjectURL(shimUrl), 10000);
-          } catch {
-            if (shimUrl) URL.revokeObjectURL(shimUrl);
-            return new target(...args);
-          }
-
-          const idToBlob = new Map();
-          const origPostMessage = worker.postMessage.bind(worker);
-          const origAddEventListener = worker.addEventListener.bind(worker);
-          const origTerminate = worker.terminate.bind(worker);
-
-          worker.postMessage = function (msg, transfer) {
-            try {
-              if (msg && typeof msg.id === 'string' && msg.chunk instanceof ArrayBuffer) {
-                const blob = bufToBlob.get(msg.chunk);
-                if (blob) {
-                  idToBlob.set(msg.id, blob);
-                  bufToBlob.delete(msg.chunk);
-                }
-              }
-            } catch {}
-            return origPostMessage(msg, transfer);
-          };
-
-          worker.addEventListener = function (type, listener, options) {
-            if (type === 'message' && typeof listener === 'function') {
-              const wrapped = function (ev) {
-                const data = ev?.data;
-                if (data && typeof data.id === 'string') {
-                  const blob = idToBlob.get(data.id);
-                  idToBlob.delete(data.id);
-                  if (data.__kioChunk instanceof ArrayBuffer) {
-                    const chunkBuf = data.__kioChunk;
-                    delete data.__kioChunk;
-                    if (blob) setCachedBuf(blob, chunkBuf);
-                  }
-                }
-                return listener.call(this, ev);
-              };
-              return origAddEventListener(type, wrapped, options);
-            }
-            return origAddEventListener(type, listener, options);
-          };
-
-          worker.terminate = function () {
-            idToBlob.clear();
-            clearCachedBufs();
-            return origTerminate();
-          };
-
-          return worker;
-        },
-      });
-    } catch {}
-  }
-
-  // 2) Disable Request.prototype.duplex so kio.ac uses native XMLHttpRequest instead of 64 KiB ReadableStream slicing.
-  // NOTE: Do NOT wrap window.fetch or XMLHttpRequest.prototype.open — kio.ac's Ad-Shield loader pre-hooks and
-  // inspects those two functions and breaks page scripts/Turnstile if they are pre-wrapped at document-start.
+  // 2) Disable Request.prototype.duplex so kio.ac uses native file-backed XMLHttpRequest.send(Blob)
+  // instead of slicing every 16 MiB chunk into 256 x 64 KiB ReadableStream arrayBuffer() allocations in JS.
+  // Keeping XHR.send(Blob) file-backed (zero ArrayBuffer caching in V8 heap) prevents renderer Out-of-Memory crashes.
   if (typeof Request !== 'undefined') {
     try {
       const desc = Object.getOwnPropertyDescriptor(Request.prototype, 'duplex');
@@ -237,26 +96,9 @@
     } catch {}
   }
 
-  // 3) Reuse worker-hashed buffers in XHR.send(Blob) and throttle upload.onprogress to 500ms
-  // (without touching XMLHttpRequest.prototype.open)
+  // 3) Throttle XMLHttpRequestUpload.onprogress to 500ms (without touching XMLHttpRequest.prototype.open/send)
   if (typeof XMLHttpRequest !== 'undefined') {
     try {
-      const origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.send = function (body) {
-        if (body instanceof Blob && body.size > 0 && body.size <= MAX_CACHEABLE_CHUNK_BYTES) {
-          const entry = cachedBlobBufs.get(body);
-          if (entry && entry.bytes === body.size) {
-            deleteCachedBuf(body);
-            diag.reusedBufs += 1;
-            return origSend.call(this, new Uint8Array(entry.buf));
-          }
-          if (cachedBlobBufs.size > 0) {
-            diag.blobFallbacks += 1;
-          }
-        }
-        return origSend.apply(this, arguments);
-      };
-
       const targetProto =
         typeof XMLHttpRequestEventTarget !== 'undefined'
           ? XMLHttpRequestEventTarget.prototype
@@ -375,7 +217,8 @@
     };
   }
 
-  // 6) Coalesce per-chunk 500ms Li speed-meter intervals (hundreds of chunks per large file -> 1 shared ticker)
+  // 6) Coalesce per-chunk 500ms Li speed-meter intervals AND fix Kiosk's lazy `this.ended` timer leak
+  // (In Kiosk, `zH` chunk tasks never evaluate `this.ended`, so their 500ms intervals & closures leak forever!)
   if (typeof window.setInterval === 'function' && typeof window.clearInterval === 'function') {
     const origSetInterval = window.setInterval.bind(window);
     const origClearInterval = window.clearInterval.bind(window);
@@ -383,6 +226,35 @@
     let nextCoalescedId = -1000000;
     let sharedTickerId = null;
     let bgTickSkip = false;
+    let mathMaxPatched = false;
+    let activeTickEntry = null;
+
+    function patchMathMaxForSpeedLeak() {
+      if (mathMaxPatched) return;
+      mathMaxPatched = true;
+      const origMax = Math.max;
+      Math.max = function (a, b) {
+        if (activeTickEntry && arguments.length === 2 && b === 0 && typeof a === 'number') {
+          if (a === 0 && activeTickEntry.zeroStreak > 0) {
+            activeTickEntry.zeroStreak += 1;
+          } else if (a === 0) {
+            activeTickEntry.zeroStreak = 1;
+          } else {
+            activeTickEntry.zeroStreak = 0;
+            activeTickEntry.hasProgressed = true;
+          }
+        }
+        return origMax.apply(this, arguments);
+      };
+    }
+
+    function stopSharedTickerIfEmpty() {
+      if (speedCallbacks.size === 0 && sharedTickerId !== null) {
+        origClearInterval(sharedTickerId);
+        sharedTickerId = null;
+        bgTickSkip = false;
+      }
+    }
 
     function runSpeedTicker() {
       if (document.hidden) {
@@ -391,19 +263,35 @@
       } else {
         bgTickSkip = false;
       }
-      for (const fn of [...speedCallbacks.values()]) {
+      for (const [id, entry] of [...speedCallbacks.entries()]) {
         try {
-          fn();
-        } catch {}
+          activeTickEntry = entry;
+          entry.fn();
+          activeTickEntry = null;
+          // If a chunk task has progressed and then stayed at 0 delta for >= 6 ticks (3s), or stayed idle before start for >= 240 ticks (2m),
+          // and its list surpasses 32 intervals, auto-retire completed/stale chunk timers so zH closures (and 16 MiB _buffers) can be GC'd.
+          if (
+            (entry.hasProgressed && entry.zeroStreak >= 6) ||
+            (speedCallbacks.size > 32 && entry.zeroStreak >= 240)
+          ) {
+            speedCallbacks.delete(id);
+            diag.speedTimersAutoFreed += 1;
+          }
+        } catch {
+          activeTickEntry = null;
+          speedCallbacks.delete(id);
+        }
       }
+      stopSharedTickerIfEmpty();
     }
 
     window.setInterval = function (fn, delay) {
       if (delay === 500 && arguments.length <= 2 && typeof fn === 'function') {
         const src = fn.toString();
         if (src.includes('this.speed') && src.includes('this.loaded') && src.includes('Math.max')) {
+          patchMathMaxForSpeedLeak();
           const id = nextCoalescedId--;
-          speedCallbacks.set(id, fn);
+          speedCallbacks.set(id, { fn, zeroStreak: 0, hasProgressed: false });
           diag.speedTimersCoalesced += 1;
           if (sharedTickerId === null) {
             sharedTickerId = origSetInterval(runSpeedTicker, 500);
@@ -417,18 +305,14 @@
     window.clearInterval = function (id) {
       if (speedCallbacks.has(id)) {
         speedCallbacks.delete(id);
-        if (speedCallbacks.size === 0 && sharedTickerId !== null) {
-          origClearInterval(sharedTickerId);
-          sharedTickerId = null;
-          bgTickSkip = false;
-        }
+        stopSharedTickerIfEmpty();
         return;
       }
       return origClearInterval(id);
     };
   }
 
-  // 7) Throttle Service Worker ZIP/stream BroadcastChannel numeric progress bursts (250ms leading + trailing)
+  // 6) Throttle Service Worker ZIP/stream BroadcastChannel numeric progress bursts (250ms leading + trailing)
   if (typeof window.BroadcastChannel === 'function') {
     try {
       const bcProto = window.BroadcastChannel.prototype;
@@ -535,5 +419,6 @@
     }
   }
 })();
+
 
 
