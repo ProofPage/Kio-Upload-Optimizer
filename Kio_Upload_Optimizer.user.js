@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.4.1
+// @version      5.4.2
 // @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus UI/UX alignment & spacing fixes for the floating task queue and /upload page.
 // @author       Page
 // @match        https://kio.ac/*
@@ -22,7 +22,7 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.4.1',
+    version: 'v5.4.2',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
@@ -71,7 +71,7 @@
       padding-bottom: 0 !important;
     }
     .fixed.right-4.bottom-4 [data-slot="accordion-content"] .w-80 {
-      width: 344px !important;
+      width: clamp(368px, 26vw, 440px) !important;
       max-width: calc(100vw - 32px) !important;
     }
     .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-content"] > div {
@@ -112,8 +112,20 @@
 
     /* /upload staging layout & spacing balance */
     .wrapper > div.flex.flex-row.p-12 {
-      padding: 28px 32px !important;
-      gap: 24px !important;
+      padding: 20px 16px !important;
+      gap: 16px !important;
+    }
+    .wrapper > div.flex.flex-row.p-12 > div:last-child {
+      width: clamp(368px, 26vw, 440px) !important;
+      min-width: 368px !important;
+      flex-shrink: 0 !important;
+    }
+    .wrapper > div.flex.flex-row.p-12 > div:last-child > .min-w-80 {
+      min-width: 0 !important;
+      width: 100% !important;
+    }
+    .wrapper > div.flex.flex-row.p-12 > div:last-child > div:last-child button[data-slot="button"] {
+      width: 100% !important;
     }
 
     /* File explorer table header/cell exact horizontal alignment (0px offset) */
