@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.2.0
-// @description  Eliminates CPU, timer, and stream-slicing overhead on kio.ac with zero extra RAM usage (native Blob XHR uploads without 64 KiB stream slicing, 500ms progress throttling, 0ms postTask pacing, 1fps chart rAF cap, shared 500ms speed ticker, BroadcastChannel & countdown rAF throttling).
+// @version      5.3.0
+// @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage (native Blob XHR uploads without 64 KiB stream slicing, 500ms progress throttling, 0ms postTask pacing, 1fps chart rAF cap, shared 500ms speed ticker with exact state-based cleanup, encrypted download buffer release, BroadcastChannel & countdown rAF throttling).
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -22,17 +22,26 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.2.0',
+    version: 'v5.3.0',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
     speedTimersCoalesced: 0,
     speedTimersAutoFreed: 0,
-    fileObjectUrlsSkipped: 0,
+    encryptedBuffersFreed: 0,
     bcThrottled: 0,
     countdownRafCapped: 0,
   };
   window.__kioUploadOptimizer = { version: diag.version, diag };
+
+  const fnToString = Function.prototype.toString;
+  function safeFnSource(fn) {
+    try {
+      return fnToString.call(fn);
+    } catch {
+      return '';
+    }
+  }
 
   function showModeChip() {
     if (!document.documentElement) return;
@@ -50,36 +59,7 @@
     showModeChip();
   }
 
-  // 1) Prevent Jn.fromFile(file) from pinning every selected upload File in URL.createObjectURL()'s global Blob URL table
-  if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' && typeof File !== 'undefined') {
-    const origCreateObjectURL = URL.createObjectURL.bind(URL);
-    let tinyPlaceholderBlob = null;
-
-    URL.createObjectURL = function (obj) {
-      if (
-        obj instanceof File &&
-        obj.size > 1024 * 1024 &&
-        (location.pathname.startsWith('/upload') || location.pathname.startsWith('/c/'))
-      ) {
-        try {
-          if (!tinyPlaceholderBlob) {
-            tinyPlaceholderBlob = new Blob([]);
-          }
-          const url = origCreateObjectURL(tinyPlaceholderBlob);
-          setTimeout(() => {
-            try {
-              URL.revokeObjectURL(url);
-            } catch {}
-          }, 0);
-          diag.fileObjectUrlsSkipped += 1;
-          return url;
-        } catch {}
-      }
-      return origCreateObjectURL(obj);
-    };
-  }
-
-  // 2) Disable Request.prototype.duplex so kio.ac uses native file-backed XMLHttpRequest.send(Blob)
+  // 1) Disable Request.prototype.duplex so kio.ac uses native file-backed XMLHttpRequest.send(Blob)
   // instead of slicing every 16 MiB chunk into 256 x 64 KiB ReadableStream arrayBuffer() allocations in JS.
   // Keeping XHR.send(Blob) file-backed (zero ArrayBuffer caching in V8 heap) prevents renderer Out-of-Memory crashes.
   if (typeof Request !== 'undefined') {
@@ -96,7 +76,7 @@
     } catch {}
   }
 
-  // 3) Throttle XMLHttpRequestUpload.onprogress to 500ms (without touching XMLHttpRequest.prototype.open/send)
+  // 2) Throttle XMLHttpRequestUpload.onprogress to 500ms (without touching XMLHttpRequest.prototype.open/send)
   if (typeof XMLHttpRequest !== 'undefined') {
     try {
       const targetProto =
@@ -129,7 +109,11 @@
             let lastRun = 0;
             const throttled = function (ev) {
               const now = performance.now();
-              if (now - lastRun >= 500 || (ev && ev.lengthComputable && ev.loaded >= ev.total)) {
+              if (
+                lastRun === 0 ||
+                now - lastRun >= 500 ||
+                (ev && ev.lengthComputable && ev.loaded >= ev.total)
+              ) {
                 lastRun = now;
                 return fn.call(this, ev);
               }
@@ -143,7 +127,7 @@
     } catch {}
   }
 
-  // 4) Replace 0ms scheduler.postTask busy-wait yields in the streaming uploader (50ms fg / 250ms bg)
+  // 3) Replace 0ms scheduler.postTask busy-wait yields in the streaming uploader (50ms fg / 150ms bg)
   const sched = window.scheduler;
   if (sched && typeof sched.postTask === 'function') {
     const origPostTask = sched.postTask.bind(sched);
@@ -152,11 +136,12 @@
       if (
         options?.priority === 'user-visible' &&
         options?.delay == null &&
+        !options?.signal &&
         typeof callback === 'function' &&
-        callback.toString().replace(/\s+/g, '') === '()=>{}'
+        safeFnSource(callback).replace(/\s+/g, '') === '()=>{}'
       ) {
         diag.postTaskSaved += 1;
-        const delayMs = document.hidden ? 250 : 50;
+        const delayMs = document.hidden ? 150 : 50;
         return new Promise((resolve) => {
           setTimeout(() => resolve(callback()), delayMs);
         });
@@ -165,7 +150,7 @@
     };
   }
 
-  // 5) Cap chartjs-plugin-streaming rAF redraws (1fps) & 5s countdown modal rAF spin (4fps)
+  // 4) Cap chartjs-plugin-streaming rAF redraws (1fps) & 5s countdown modal rAF spin (4fps)
   const origRAF = window.requestAnimationFrame?.bind(window);
   const origCancelRAF = window.cancelAnimationFrame?.bind(window);
   if (origRAF && origCancelRAF) {
@@ -174,7 +159,7 @@
 
     window.requestAnimationFrame = function (callback) {
       if (typeof callback === 'function') {
-        const src = callback.toString();
+        const src = safeFnSource(callback);
         if (src.includes('nextRefresh') && src.includes('frameRequestID')) {
           if (document.hidden) {
             return origRAF(callback);
@@ -208,17 +193,22 @@
     };
 
     window.cancelAnimationFrame = function (id) {
-      if (rafTimers.has(id)) {
-        clearTimeout(rafTimers.get(id));
-        rafTimers.delete(id);
+      if (typeof id === 'number' && id < 0) {
+        if (rafTimers.has(id)) {
+          clearTimeout(rafTimers.get(id));
+          rafTimers.delete(id);
+        }
         return;
       }
       return origCancelRAF(id);
     };
   }
 
-  // 6) Coalesce per-chunk 500ms Li speed-meter intervals AND fix Kiosk's lazy `this.ended` timer leak
-  // (In Kiosk, `zH` chunk tasks never evaluate `this.ended`, so their 500ms intervals & closures leak forever!)
+  // 5) Coalesce per-chunk 500ms Li speed-meter intervals AND fix Kiosk's state-completion leaks:
+  // - Kiosk clears `Li.interval` only inside lazy getter `ended`, which is often never read on `zH` chunks.
+  // - Kiosk's `zH._startEncrypted()` never releases its 16 MiB `this._buffer` Uint8Array after writing to disk.
+  // Clearing both strictly on terminal `state` events (4=done, 5=aborted) preserves active, queued, paused (3),
+  // and retrying (6) tasks with zero heuristics and zero global Math.max patching.
   if (typeof window.setInterval === 'function' && typeof window.clearInterval === 'function') {
     const origSetInterval = window.setInterval.bind(window);
     const origClearInterval = window.clearInterval.bind(window);
@@ -226,27 +216,6 @@
     let nextCoalescedId = -1000000;
     let sharedTickerId = null;
     let bgTickSkip = false;
-    let mathMaxPatched = false;
-    let activeTickEntry = null;
-
-    function patchMathMaxForSpeedLeak() {
-      if (mathMaxPatched) return;
-      mathMaxPatched = true;
-      const origMax = Math.max;
-      Math.max = function (a, b) {
-        if (activeTickEntry && arguments.length === 2 && b === 0 && typeof a === 'number') {
-          if (a === 0 && activeTickEntry.zeroStreak > 0) {
-            activeTickEntry.zeroStreak += 1;
-          } else if (a === 0) {
-            activeTickEntry.zeroStreak = 1;
-          } else {
-            activeTickEntry.zeroStreak = 0;
-            activeTickEntry.hasProgressed = true;
-          }
-        }
-        return origMax.apply(this, arguments);
-      };
-    }
 
     function stopSharedTickerIfEmpty() {
       if (speedCallbacks.size === 0 && sharedTickerId !== null) {
@@ -263,22 +232,10 @@
       } else {
         bgTickSkip = false;
       }
-      for (const [id, entry] of [...speedCallbacks.entries()]) {
+      for (const [id, fn] of [...speedCallbacks.entries()]) {
         try {
-          activeTickEntry = entry;
-          entry.fn();
-          activeTickEntry = null;
-          // If a chunk task has progressed and then stayed at 0 delta for >= 6 ticks (3s), or stayed idle before start for >= 240 ticks (2m),
-          // and its list surpasses 32 intervals, auto-retire completed/stale chunk timers so zH closures (and 16 MiB _buffers) can be GC'd.
-          if (
-            (entry.hasProgressed && entry.zeroStreak >= 6) ||
-            (speedCallbacks.size > 32 && entry.zeroStreak >= 240)
-          ) {
-            speedCallbacks.delete(id);
-            diag.speedTimersAutoFreed += 1;
-          }
+          fn();
         } catch {
-          activeTickEntry = null;
           speedCallbacks.delete(id);
         }
       }
@@ -287,11 +244,10 @@
 
     window.setInterval = function (fn, delay) {
       if (delay === 500 && arguments.length <= 2 && typeof fn === 'function') {
-        const src = fn.toString();
+        const src = safeFnSource(fn);
         if (src.includes('this.speed') && src.includes('this.loaded') && src.includes('Math.max')) {
-          patchMathMaxForSpeedLeak();
           const id = nextCoalescedId--;
-          speedCallbacks.set(id, { fn, zeroStreak: 0, hasProgressed: false });
+          speedCallbacks.set(id, fn);
           diag.speedTimersCoalesced += 1;
           if (sharedTickerId === null) {
             sharedTickerId = origSetInterval(runSpeedTicker, 500);
@@ -310,6 +266,25 @@
       }
       return origClearInterval(id);
     };
+
+    if (typeof EventTarget !== 'undefined' && typeof EventTarget.prototype.dispatchEvent === 'function') {
+      const origDispatchEvent = EventTarget.prototype.dispatchEvent;
+      EventTarget.prototype.dispatchEvent = function (ev) {
+        const result = origDispatchEvent.call(this, ev);
+        if (ev && ev.type === 'state' && (ev.detail === 4 || ev.detail === 5)) {
+          if (this && typeof this.interval === 'number' && speedCallbacks.has(this.interval)) {
+            speedCallbacks.delete(this.interval);
+            stopSharedTickerIfEmpty();
+            diag.speedTimersAutoFreed += 1;
+          }
+          if (this && this.type === 'download:handle:chunk' && this._buffer instanceof Uint8Array) {
+            this._buffer = undefined;
+            diag.encryptedBuffersFreed += 1;
+          }
+        }
+        return result;
+      };
+    }
   }
 
   // 6) Throttle Service Worker ZIP/stream BroadcastChannel numeric progress bursts (250ms leading + trailing)
@@ -336,9 +311,11 @@
                 : null;
           },
           set(fn) {
-            const prevTimer = channelTimers.get(this);
-            if (prevTimer) {
-              clearTimeout(prevTimer.tid);
+            const prevState = channelTimers.get(this);
+            if (prevState) {
+              if (prevState.tid) clearTimeout(prevState.tid);
+              prevState.tid = null;
+              prevState.pendingEv = null;
               channelTimers.delete(this);
             }
             if (typeof fn !== 'function' || typeof this.name !== 'string' || !this.name.includes(':')) {
@@ -347,7 +324,7 @@
             }
 
             let lastRun = 0;
-            const state = { tid: null, pendingEv: null, ctx: this };
+            const state = { tid: null, pendingEv: null, ctx: this, closed: false };
             channelTimers.set(this, state);
 
             const flush = () => {
@@ -357,19 +334,20 @@
               }
               const ev = state.pendingEv;
               state.pendingEv = null;
-              if (ev) {
+              if (ev && !state.closed) {
                 lastRun = performance.now();
                 fn.call(state.ctx, ev);
               }
             };
 
             const throttled = function (ev) {
+              if (state.closed) return;
               if (typeof ev?.data !== 'number') {
                 flush();
                 return fn.call(this, ev);
               }
               const now = performance.now();
-              const elapsed = now - lastRun;
+              const elapsed = lastRun === 0 ? 250 : now - lastRun;
               if (elapsed >= 250) {
                 if (state.tid) {
                   clearTimeout(state.tid);
@@ -395,28 +373,19 @@
           bcProto.close = function () {
             const state = channelTimers.get(this);
             if (state) {
-              flushAndClear(state, this);
               channelTimers.delete(this);
+              state.closed = true;
+              if (state.tid) {
+                clearTimeout(state.tid);
+                state.tid = null;
+              }
+              state.pendingEv = null;
             }
             return origClose.apply(this, arguments);
           };
         }
       }
     } catch {}
-  }
-
-  function flushAndClear(state, ctx) {
-    if (state.tid) {
-      clearTimeout(state.tid);
-      state.tid = null;
-    }
-    const ev = state.pendingEv;
-    state.pendingEv = null;
-    if (ev && typeof ctx?.onmessage === 'function') {
-      try {
-        ctx.onmessage(ev);
-      } catch {}
-    }
   }
 })();
 
