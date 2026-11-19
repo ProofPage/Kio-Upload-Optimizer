@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.4.3
-// @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus UI/UX alignment & spacing fixes for the floating task queue and /upload page.
+// @version      5.5.0
+// @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus desktop & mobile UI/UX alignment, spacing, and task-tray overlap fixes.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -22,7 +22,7 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.4.3',
+    version: 'v5.5.0',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
@@ -45,9 +45,10 @@
   }
 
   const UI_FIX_CSS = `
-    /* Floating task queue widget (bottom-right) */
+    /* Floating task queue widget (bottom-right, desktop & mobile safe-area aware) */
     .fixed.right-4.bottom-4 {
       z-index: 40 !important;
+      bottom: calc(16px + env(safe-area-inset-bottom, 0px)) !important;
     }
     /* Fix chevron toggle button: ml-auto + rotate-180 + py-4 shoved the arrow 1px against the left border */
     .fixed.right-4.bottom-4 > [data-slot="accordion"] > [data-slot="accordion-item"] > .flex.justify-end [data-slot="accordion-trigger"] {
@@ -110,7 +111,7 @@
       height: 3px !important;
     }
 
-    /* /upload staging layout & spacing balance */
+    /* /upload desktop staging layout & spacing balance */
     .wrapper > div.flex.flex-row.p-12 {
       padding: 20px 16px !important;
       gap: 16px !important;
@@ -122,7 +123,7 @@
       flex-shrink: 0 !important;
       overflow-y: auto !important;
       scrollbar-width: thin;
-      padding-bottom: var(--kio-task-tray-offset, 0px) !important;
+      padding-bottom: max(0px, calc(var(--kio-task-tray-h, 0px) - 8px)) !important;
       transition: padding-bottom 160ms ease !important;
     }
     .wrapper > div.flex.flex-row.p-12 > div:last-child > .min-w-80 {
@@ -131,6 +132,33 @@
     }
     .wrapper > div.flex.flex-row.p-12 > div:last-child > div:last-child button[data-slot="button"] {
       width: 100% !important;
+    }
+
+    /* /upload mobile staging layout (<= 768px flex-col) */
+    .wrapper > div.flex.flex-col > div:first-child.min-h-144 {
+      min-height: 220px !important;
+      max-height: 46dvh !important;
+      height: auto !important;
+      flex-shrink: 0 !important;
+    }
+    .wrapper > div.flex.flex-col > div:first-child > div.p-4 {
+      padding: 12px 16px !important;
+      gap: 12px !important;
+      align-items: stretch !important;
+    }
+    .wrapper > div.flex.flex-col > div:last-child {
+      padding: 12px 16px calc(16px + env(safe-area-inset-bottom, 0px) + var(--kio-task-tray-h, 0px)) 16px !important;
+      gap: 20px !important;
+      transition: padding-bottom 160ms ease !important;
+    }
+    .wrapper > div.flex.flex-col .min-w-80 {
+      min-width: 0 !important;
+      width: 100% !important;
+    }
+    .wrapper > div.flex.flex-col > div:last-child > div:last-child button[data-slot="button"] {
+      width: 100% !important;
+      height: 44px !important;
+      font-size: 15px !important;
     }
 
     /* File explorer table header/cell exact horizontal alignment (0px offset) */
@@ -154,8 +182,8 @@
       font-variant-numeric: tabular-nums !important;
     }
 
-    /* File explorer footer stats bar */
-    .wrapper > div > div:first-child > div.p-4 {
+    /* Desktop file explorer footer stats bar (scoped so mobile flex-col keeps full-width bars) */
+    .wrapper > div.flex.flex-row.p-12 > div:first-child > div.p-4 {
       padding: 14px 16px !important;
       gap: 20px !important;
       align-items: center !important;
@@ -167,7 +195,7 @@
       font-variant-numeric: tabular-nums !important;
     }
 
-    /* Right options panel: fix accordion py-4 clash, section spacing, date & password inputs */
+    /* Options panel: fix accordion py-4 clash, section spacing, date & password inputs */
     .wrapper [data-slot="accordion-trigger"] {
       padding-top: 0 !important;
       padding-bottom: 0 !important;
@@ -189,6 +217,19 @@
     .wrapper .relative > input[data-slot="input"]:has(+ button) {
       padding-right: 42px !important;
     }
+
+    @media (max-width: 768px) {
+      /* Prevent iOS Safari auto-zoom on <16px inputs */
+      .wrapper input[type="datetime-local"] {
+        font-size: 16px !important;
+        height: 40px !important;
+      }
+      /* Larger touch targets for floating task controls on mobile */
+      .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] > div:first-child > div:last-child [data-slot="button"] {
+        width: 36px !important;
+        height: 36px !important;
+      }
+    }
   `;
 
   let trayResizeObs = null;
@@ -200,19 +241,16 @@
         ? observedTray
         : document.querySelector('.fixed.right-4.bottom-4');
     if (!tray) {
-      document.documentElement.style.setProperty('--kio-task-tray-offset', '0px');
+      document.documentElement.style.setProperty('--kio-task-tray-h', '0px');
       return;
     }
     const r = tray.getBoundingClientRect();
     if (r.height > 0 && r.width > 0) {
-      const maxClearance = Math.floor(window.innerHeight * 0.65);
-      const clearance = Math.min(
-        maxClearance,
-        Math.max(0, Math.ceil(window.innerHeight - r.top - 20 + 12)),
-      );
-      document.documentElement.style.setProperty('--kio-task-tray-offset', `${clearance}px`);
+      const maxH = Math.floor(window.innerHeight * 0.65);
+      const trayH = Math.min(maxH, Math.max(0, Math.ceil(window.innerHeight - r.top)));
+      document.documentElement.style.setProperty('--kio-task-tray-h', `${trayH}px`);
     } else {
-      document.documentElement.style.setProperty('--kio-task-tray-offset', '0px');
+      document.documentElement.style.setProperty('--kio-task-tray-h', '0px');
     }
   }
 

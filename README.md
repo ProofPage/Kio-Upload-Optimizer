@@ -33,12 +33,13 @@
   - Throttles numeric `BroadcastChannel` progress bursts from Service Worker ZIP/stream downloads to `250ms` (leading + trailing) and cleanly cancels pending trailing timers on `close()` so aborted channels never fire stale updates.
   - Paces the 5-second modal's `requestAnimationFrame` countdown loop to `250ms` instead of burning 60–144fps frames on `Math.floor` integer seconds.
 
-### UI/UX Alignment & Spacing Fixes (`/upload` & Task Queue)
+### UI/UX Alignment & Spacing Fixes (Desktop & Mobile)
 - **Floating Task Queue Widget (Bottom-Right)**:
-  - Centers the collapse/expand chevron icon cleanly inside its `36×36` toggle button (fixing Kiosk's `ml-auto` + `rotate-180` + `py-4` clash that pushed the arrow 1px against the left edge), removes stray `ml-2` / `pb-4` spacing, adds an opaque elevated card surface so underlying buttons never bleed through, and balances internal row padding and progress bar alignment.
+  - Centers the collapse/expand chevron icon cleanly inside its `36×36` toggle button (fixing Kiosk's `ml-auto` + `rotate-180` + `py-4` clash that pushed the arrow 1px against the left edge), removes stray `ml-2` / `pb-4` spacing, adds an opaque elevated card surface so underlying buttons never bleed through, balances internal row padding/progress bar alignment, and respects mobile `env(safe-area-inset-bottom)`.
 - **`/upload` Staging Layout & Table Alignment**:
-  - Expands the right options panel & `업로드 & 링크 생성` button horizontally (`clamp(368px, 26vw, 440px)`) with tight balanced `16px` outer/column margins so it stretches cleanly to the left and right and matches the floating task card width.
-  - Dynamically reserves bottom clearance via `ResizeObserver` whenever the floating task queue tray is visible (expanded or collapsed) so Cloudflare Turnstile and the `업로드 & 링크 생성` button smoothly lift above the tray with a `12px` gap and are never covered.
+  - Expands the desktop right options panel & `업로드 & 링크 생성` button horizontally (`clamp(368px, 26vw, 440px)`) with tight balanced `16px` outer/column margins matching the floating task card width.
+  - Dynamically reserves bottom clearance via `ResizeObserver` on **both desktop and mobile** whenever the floating task queue tray is visible (expanded or collapsed) so Cloudflare Turnstile and the `업로드 & 링크 생성` button are never covered.
+  - Fixes mobile `/upload` layout issues: replaces Kiosk's 576px empty `min-h-144` file box with a compact scrollable `220px–46dvh` area, keeps mobile progress bars full-width, unifies `16px` horizontal padding across stats and options, prevents `.min-w-80` overflow on narrow 320–360px phones, bumps `datetime-local` to `16px` to stop iOS Safari auto-zoom, and enlarges primary CTA/task buttons to comfortable touch targets (`44px` / `36px`).
   - Aligns file explorer `이름` and `크기` column headers to exact `0px` offset with their row values, centers file icons in a 40px first column, applies `tabular-nums` to sizes/stats, fixes `py-4` padding clash on option accordion headers (`제목 & 설명`, `비밀번호`), harmonizes section spacing, centers `datetime-local` text, and adds right padding on password inputs so typed text never runs under the visibility toggle icon.
 
 ---
