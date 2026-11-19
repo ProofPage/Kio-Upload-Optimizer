@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.5.0
-// @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus desktop & mobile UI/UX alignment, spacing, and task-tray overlap fixes.
+// @version      5.6.0
+// @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus desktop & mobile UI/UX alignment, spacing, and hydration-safe task-tray overlap fixes.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -22,7 +22,7 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.5.0',
+    version: 'v5.6.0',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
@@ -74,8 +74,13 @@
     .fixed.right-4.bottom-4 [data-slot="accordion-content"] .w-80 {
       width: clamp(368px, 26vw, 440px) !important;
       max-width: calc(100vw - 32px) !important;
+      max-height: min(40vh, 300px) !important;
+      scrollbar-width: thin;
     }
+    /* Nested sub-task accordion inside a Collection card */
     .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-content"] > div {
+      margin-left: 8px !important;
+      padding-top: 6px !important;
       padding-bottom: 0 !important;
     }
     /* Make floating task cards opaque & cleanly spaced so underlying buttons never bleed through */
@@ -106,69 +111,81 @@
       width: 32px !important;
       height: 32px !important;
     }
+    /* Hide Kiosk's empty invisible pause button rendered on completed tasks */
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] > div:first-child > div:last-child [data-slot="button"]:empty {
+      display: none !important;
+    }
     .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="progress"] {
       border-radius: 0 !important;
       height: 3px !important;
     }
 
-    /* /upload desktop staging layout & spacing balance */
-    .wrapper > div.flex.flex-row.p-12 {
+    /* /upload desktop staging layout (scoped via :has(> div > .min-w-80) so no other route is affected) */
+    .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) {
       padding: 20px 16px !important;
       gap: 16px !important;
     }
-    .wrapper > div.flex.flex-row.p-12 > div:last-child {
+    .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child {
       width: clamp(368px, 26vw, 440px) !important;
       min-width: 368px !important;
+      height: 100% !important;
       min-height: 0 !important;
       flex-shrink: 0 !important;
-      overflow-y: auto !important;
-      scrollbar-width: thin;
+      overflow: hidden !important;
+      gap: 12px !important;
       padding-bottom: max(0px, calc(var(--kio-task-tray-h, 0px) - 8px)) !important;
-      transition: padding-bottom 160ms ease !important;
     }
-    .wrapper > div.flex.flex-row.p-12 > div:last-child > .min-w-80 {
+    .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child > .min-w-80 {
       min-width: 0 !important;
       width: 100% !important;
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+      overflow-y: auto !important;
+      scrollbar-width: thin;
+      padding-right: 2px;
     }
-    .wrapper > div.flex.flex-row.p-12 > div:last-child > div:last-child button[data-slot="button"] {
+    .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child > div:last-child {
+      flex-shrink: 0 !important;
+    }
+    .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child > div:last-child [data-slot="turnstile"],
+    .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child > div:last-child button[data-slot="button"] {
       width: 100% !important;
     }
 
-    /* /upload mobile staging layout (<= 768px flex-col) */
-    .wrapper > div.flex.flex-col > div:first-child.min-h-144 {
+    /* /upload mobile staging layout (<= 768px flex-col, strictly scoped to staging screen) */
+    .wrapper > div.flex.flex-col:has(> div > .min-w-80) > div:first-child.min-h-144 {
       min-height: 220px !important;
       max-height: 46dvh !important;
       height: auto !important;
       flex-shrink: 0 !important;
     }
-    .wrapper > div.flex.flex-col > div:first-child > div.p-4 {
+    .wrapper > div.flex.flex-col:has(> div > .min-w-80) > div:first-child > div.p-4 {
       padding: 12px 16px !important;
       gap: 12px !important;
       align-items: stretch !important;
     }
-    .wrapper > div.flex.flex-col > div:last-child {
+    .wrapper > div.flex.flex-col:has(> div > .min-w-80) > div:last-child {
       padding: 12px 16px calc(16px + env(safe-area-inset-bottom, 0px) + var(--kio-task-tray-h, 0px)) 16px !important;
       gap: 20px !important;
-      transition: padding-bottom 160ms ease !important;
     }
-    .wrapper > div.flex.flex-col .min-w-80 {
+    .wrapper > div.flex.flex-col:has(> div > .min-w-80) .min-w-80 {
       min-width: 0 !important;
       width: 100% !important;
     }
-    .wrapper > div.flex.flex-col > div:last-child > div:last-child button[data-slot="button"] {
+    .wrapper > div.flex.flex-col:has(> div > .min-w-80) > div:last-child > div:last-child button[data-slot="button"] {
       width: 100% !important;
       height: 44px !important;
       font-size: 15px !important;
     }
 
-    /* File explorer table header/cell exact horizontal alignment (0px offset) */
-    table th[data-slot="table-head"]:first-child,
-    table td[data-slot="table-cell"]:first-child {
+    /* File explorer table header/cell exact horizontal alignment (0px offset, scoped to FileExplorer tables) */
+    table:has(th[data-slot="table-head"]:nth-child(2) button[data-slot="button"]) th[data-slot="table-head"]:first-child,
+    table:has(th[data-slot="table-head"]:nth-child(2) button[data-slot="button"]) td[data-slot="table-cell"]:first-child {
       width: 40px !important;
       padding-left: 12px !important;
       padding-right: 4px !important;
     }
-    table td[data-slot="table-cell"]:first-child svg {
+    table:has(th[data-slot="table-head"]:nth-child(2) button[data-slot="button"]) td[data-slot="table-cell"]:first-child svg {
       display: block !important;
       margin: 0 auto !important;
     }
@@ -178,25 +195,25 @@
     table th[data-slot="table-head"]:nth-child(3) button[data-slot="button"].mr-8 {
       margin-right: 24px !important;
     }
-    table td[data-slot="table-cell"]:nth-child(3) {
+    table:has(th[data-slot="table-head"]:nth-child(2) button[data-slot="button"]) td[data-slot="table-cell"]:nth-child(3) {
       font-variant-numeric: tabular-nums !important;
     }
 
     /* Desktop file explorer footer stats bar (scoped so mobile flex-col keeps full-width bars) */
-    .wrapper > div.flex.flex-row.p-12 > div:first-child > div.p-4 {
+    .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:first-child > div.p-4 {
       padding: 14px 16px !important;
       gap: 20px !important;
       align-items: center !important;
     }
-    .wrapper > div > div:first-child > div.p-4 .flex-1.flex-col {
+    .wrapper > div:has(> div > .min-w-80) > div:first-child > div.p-4 .flex-1.flex-col {
       gap: 8px !important;
     }
-    .wrapper > div > div:first-child > div.p-4 label {
+    .wrapper > div:has(> div > .min-w-80) > div:first-child > div.p-4 label {
       font-variant-numeric: tabular-nums !important;
     }
 
     /* Options panel: fix accordion py-4 clash, section spacing, date & password inputs */
-    .wrapper [data-slot="accordion-trigger"] {
+    .wrapper .min-w-80 [data-slot="accordion-trigger"] {
       padding-top: 0 !important;
       padding-bottom: 0 !important;
       align-items: center !important;
@@ -205,10 +222,10 @@
       padding-top: 8px !important;
       gap: 10px !important;
     }
-    .wrapper [data-slot="accordion-content"] > div {
+    .wrapper .min-w-80 [data-slot="accordion-content"] > div {
       padding-bottom: 4px !important;
     }
-    .wrapper input[type="datetime-local"] {
+    .wrapper .min-w-80 input[type="datetime-local"] {
       padding-top: 0 !important;
       padding-bottom: 0 !important;
       align-items: center !important;
@@ -220,7 +237,7 @@
 
     @media (max-width: 768px) {
       /* Prevent iOS Safari auto-zoom on <16px inputs */
-      .wrapper input[type="datetime-local"] {
+      .wrapper .min-w-80 input[type="datetime-local"] {
         font-size: 16px !important;
         height: 40px !important;
       }
@@ -233,13 +250,46 @@
   `;
 
   let trayResizeObs = null;
+  let trayMountObs = null;
   let observedTray = null;
+  let trayObserverBound = false;
+
+  function watchTrayLifecycle() {
+    if (typeof MutationObserver !== 'function' || !document.body) return;
+    if (!trayMountObs) {
+      trayMountObs = new MutationObserver(() => {
+        if (observedTray && observedTray.isConnected) return;
+        syncTaskTrayOffset();
+      });
+    }
+    trayMountObs.disconnect();
+    if (observedTray && observedTray.isConnected && observedTray.parentElement) {
+      // Zero-overhead mode: watch only shallow direct children of tray's parent and body,
+      // so DOM updates inside file lists/progress bars never wake MutationObserver.
+      trayMountObs.observe(observedTray.parentElement, { childList: true });
+      if (observedTray.parentElement !== document.body) {
+        trayMountObs.observe(document.body, { childList: true });
+      }
+    } else {
+      // Discovery/hydration mode: locate the live tray node, then immediately narrow scope.
+      trayMountObs.observe(document.body, { childList: true, subtree: true });
+    }
+  }
 
   function syncTaskTrayOffset() {
-    const tray =
-      observedTray && observedTray.isConnected
-        ? observedTray
-        : document.querySelector('.fixed.right-4.bottom-4');
+    if (observedTray && !observedTray.isConnected) {
+      observedTray = null;
+    }
+    const tray = observedTray || document.querySelector('.fixed.right-4.bottom-4');
+    if (tray && tray !== observedTray && typeof ResizeObserver === 'function') {
+      if (trayResizeObs) trayResizeObs.disconnect();
+      observedTray = tray;
+      trayResizeObs = new ResizeObserver(syncTaskTrayOffset);
+      trayResizeObs.observe(tray);
+      watchTrayLifecycle();
+    } else if (!tray) {
+      watchTrayLifecycle();
+    }
     if (!tray) {
       document.documentElement.style.setProperty('--kio-task-tray-h', '0px');
       return;
@@ -255,27 +305,14 @@
   }
 
   function bindTaskTrayObserver() {
-    if (typeof ResizeObserver !== 'function') return;
-    const attach = () => {
-      const tray = document.querySelector('.fixed.right-4.bottom-4');
-      if (!tray) return false;
-      if (observedTray !== tray) {
-        if (trayResizeObs) trayResizeObs.disconnect();
-        observedTray = tray;
-        trayResizeObs = new ResizeObserver(syncTaskTrayOffset);
-        trayResizeObs.observe(tray);
-      }
-      syncTaskTrayOffset();
-      return true;
-    };
+    if (trayObserverBound) return;
+    trayObserverBound = true;
     window.addEventListener('resize', syncTaskTrayOffset, { passive: true });
-    if (attach()) return;
-    if (typeof MutationObserver === 'function' && document.body) {
-      const mo = new MutationObserver(() => {
-        if (attach()) mo.disconnect();
-      });
-      mo.observe(document.body, { childList: true, subtree: true });
+    window.addEventListener('load', syncTaskTrayOffset, { once: true });
+    if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', syncTaskTrayOffset, { passive: true });
     }
+    syncTaskTrayOffset();
   }
 
   function injectUiFixes() {
