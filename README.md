@@ -38,7 +38,6 @@
   - Centers the collapse/expand chevron icon cleanly inside its `36×36` toggle button (fixing Kiosk's `ml-auto` + `rotate-180` + `py-4` clash that pushed the arrow 1px against the left edge), removes stray `ml-2` / `pb-4` spacing, adds an opaque elevated card surface so underlying buttons never bleed through, and balances internal row padding and progress bar alignment.
 - **`/upload` Staging Layout & Table Alignment**:
   - Aligns file explorer `이름` and `크기` column headers to exact `0px` offset with their row values, centers file icons in a 40px first column, applies `tabular-nums` to sizes/stats, fixes `py-4` padding clash on option accordion headers (`제목 & 설명`, `비밀번호`), harmonizes section spacing, centers `datetime-local` text, and adds right padding on password inputs so typed text never runs under the visibility toggle icon.
-  - Moves the `Kio: CPU & Memory Optimized` status badge to the empty center of the top header bar so it never overlaps the bottom-right task queue or upload button.
 
 ---
 
@@ -50,7 +49,7 @@
 2. Open the userscript installation URL:
    - Click to install [`Kio_Upload_Optimizer.user.js`](https://github.com/ProofPage/Kio-Upload-Optimizer/raw/main/Kio_Upload_Optimizer.user.js) (or jsDelivr `@main`).
 3. Confirm the installation prompt in your userscript manager.
-4. Refresh `https://kio.ac` before starting an upload or download. When active, a subtle `Kio: CPU & Memory Optimized` badge appears centered in the top header bar.
+4. Refresh `https://kio.ac` before starting an upload or download. You can verify it is active anytime via `window.__kioUploadOptimizer.diag` in DevTools.
 
 For Tampermonkey 5.3+ in Chrome-based browsers, enable **Allow User Scripts** in the extension settings (Chrome 138+) or enable **Developer Mode**. See the [official permission instructions](https://www.tampermonkey.net/faq.php?q=Q209).
 

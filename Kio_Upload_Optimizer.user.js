@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.4.0
+// @version      5.4.1
 // @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus UI/UX alignment & spacing fixes for the floating task queue and /upload page.
 // @author       Page
 // @match        https://kio.ac/*
@@ -22,7 +22,7 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.4.0',
+    version: 'v5.4.1',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
@@ -172,36 +172,9 @@
     .wrapper .relative > input[data-slot="input"]:has(+ button) {
       padding-right: 42px !important;
     }
-
-    /* Non-overlapping optimizer status badge centered in the top header bar */
-    #kio-optimizer-chip {
-      position: fixed;
-      top: 10px;
-      left: 50%;
-      transform: translateX(-50%);
-      z-index: 30;
-      display: inline-flex;
-      align-items: center;
-      height: 28px;
-      padding: 0 10px;
-      border-radius: 9999px;
-      border: 1px solid var(--border, rgba(148, 163, 184, 0.25));
-      background: var(--background, rgba(17, 17, 17, 0.85));
-      color: var(--foreground, #fff);
-      font: 500 11px/1 system-ui, sans-serif;
-      letter-spacing: 0.01em;
-      pointer-events: none;
-      opacity: 0.78;
-      white-space: nowrap;
-    }
-    @media (max-width: 900px) {
-      #kio-optimizer-chip {
-        display: none;
-      }
-    }
   `;
 
-  function injectUiFixesAndChip() {
+  function injectUiFixes() {
     if (!document.documentElement) return;
     if (!document.getElementById('kio-ui-ux-fixes')) {
       const style = document.createElement('style');
@@ -210,18 +183,12 @@
       (document.head || document.documentElement).appendChild(style);
       diag.uiFixesApplied = true;
     }
-    if (!document.getElementById('kio-optimizer-chip')) {
-      const chip = document.createElement('div');
-      chip.id = 'kio-optimizer-chip';
-      chip.textContent = 'Kio: CPU & Memory Optimized';
-      document.documentElement.appendChild(chip);
-    }
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', injectUiFixesAndChip, { once: true });
+    document.addEventListener('DOMContentLoaded', injectUiFixes, { once: true });
   } else {
-    injectUiFixesAndChip();
+    injectUiFixes();
   }
 
   // 1) Disable Request.prototype.duplex so kio.ac uses native file-backed XMLHttpRequest.send(Blob)
