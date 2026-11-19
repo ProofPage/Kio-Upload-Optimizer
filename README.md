@@ -38,6 +38,7 @@
   - Centers the collapse/expand chevron icon cleanly inside its `36×36` toggle button (fixing Kiosk's `ml-auto` + `rotate-180` + `py-4` clash that pushed the arrow 1px against the left edge), removes stray `ml-2` / `pb-4` spacing, adds an opaque elevated card surface so underlying buttons never bleed through, and balances internal row padding and progress bar alignment.
 - **`/upload` Staging Layout & Table Alignment**:
   - Expands the right options panel & `업로드 & 링크 생성` button horizontally (`clamp(368px, 26vw, 440px)`) with tight balanced `16px` outer/column margins so it stretches cleanly to the left and right and matches the floating task card width.
+  - Dynamically reserves bottom clearance via `ResizeObserver` whenever the floating task queue tray is visible (expanded or collapsed) so Cloudflare Turnstile and the `업로드 & 링크 생성` button smoothly lift above the tray with a `12px` gap and are never covered.
   - Aligns file explorer `이름` and `크기` column headers to exact `0px` offset with their row values, centers file icons in a 40px first column, applies `tabular-nums` to sizes/stats, fixes `py-4` padding clash on option accordion headers (`제목 & 설명`, `비밀번호`), harmonizes section spacing, centers `datetime-local` text, and adds right padding on password inputs so typed text never runs under the visibility toggle icon.
 
 ---

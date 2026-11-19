@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.4.2
+// @version      5.4.3
 // @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus UI/UX alignment & spacing fixes for the floating task queue and /upload page.
 // @author       Page
 // @match        https://kio.ac/*
@@ -22,7 +22,7 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.4.2',
+    version: 'v5.4.3',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
@@ -118,7 +118,12 @@
     .wrapper > div.flex.flex-row.p-12 > div:last-child {
       width: clamp(368px, 26vw, 440px) !important;
       min-width: 368px !important;
+      min-height: 0 !important;
       flex-shrink: 0 !important;
+      overflow-y: auto !important;
+      scrollbar-width: thin;
+      padding-bottom: var(--kio-task-tray-offset, 0px) !important;
+      transition: padding-bottom 160ms ease !important;
     }
     .wrapper > div.flex.flex-row.p-12 > div:last-child > .min-w-80 {
       min-width: 0 !important;
@@ -186,6 +191,55 @@
     }
   `;
 
+  let trayResizeObs = null;
+  let observedTray = null;
+
+  function syncTaskTrayOffset() {
+    const tray =
+      observedTray && observedTray.isConnected
+        ? observedTray
+        : document.querySelector('.fixed.right-4.bottom-4');
+    if (!tray) {
+      document.documentElement.style.setProperty('--kio-task-tray-offset', '0px');
+      return;
+    }
+    const r = tray.getBoundingClientRect();
+    if (r.height > 0 && r.width > 0) {
+      const maxClearance = Math.floor(window.innerHeight * 0.65);
+      const clearance = Math.min(
+        maxClearance,
+        Math.max(0, Math.ceil(window.innerHeight - r.top - 20 + 12)),
+      );
+      document.documentElement.style.setProperty('--kio-task-tray-offset', `${clearance}px`);
+    } else {
+      document.documentElement.style.setProperty('--kio-task-tray-offset', '0px');
+    }
+  }
+
+  function bindTaskTrayObserver() {
+    if (typeof ResizeObserver !== 'function') return;
+    const attach = () => {
+      const tray = document.querySelector('.fixed.right-4.bottom-4');
+      if (!tray) return false;
+      if (observedTray !== tray) {
+        if (trayResizeObs) trayResizeObs.disconnect();
+        observedTray = tray;
+        trayResizeObs = new ResizeObserver(syncTaskTrayOffset);
+        trayResizeObs.observe(tray);
+      }
+      syncTaskTrayOffset();
+      return true;
+    };
+    window.addEventListener('resize', syncTaskTrayOffset, { passive: true });
+    if (attach()) return;
+    if (typeof MutationObserver === 'function' && document.body) {
+      const mo = new MutationObserver(() => {
+        if (attach()) mo.disconnect();
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+    }
+  }
+
   function injectUiFixes() {
     if (!document.documentElement) return;
     if (!document.getElementById('kio-ui-ux-fixes')) {
@@ -195,6 +249,7 @@
       (document.head || document.documentElement).appendChild(style);
       diag.uiFixesApplied = true;
     }
+    bindTaskTrayObserver();
   }
 
   if (document.readyState === 'loading') {
