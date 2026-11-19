@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.3.0
-// @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage (native Blob XHR uploads without 64 KiB stream slicing, 500ms progress throttling, 0ms postTask pacing, 1fps chart rAF cap, shared 500ms speed ticker with exact state-based cleanup, encrypted download buffer release, BroadcastChannel & countdown rAF throttling).
+// @version      5.4.0
+// @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus UI/UX alignment & spacing fixes for the floating task queue and /upload page.
 // @author       Page
 // @match        https://kio.ac/*
 // @homepageURL  https://github.com/ProofPage/Kio-Upload-Optimizer
@@ -22,7 +22,7 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.3.0',
+    version: 'v5.4.0',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
@@ -31,6 +31,7 @@
     encryptedBuffersFreed: 0,
     bcThrottled: 0,
     countdownRafCapped: 0,
+    uiFixesApplied: false,
   };
   window.__kioUploadOptimizer = { version: diag.version, diag };
 
@@ -43,20 +44,184 @@
     }
   }
 
-  function showModeChip() {
+  const UI_FIX_CSS = `
+    /* Floating task queue widget (bottom-right) */
+    .fixed.right-4.bottom-4 {
+      z-index: 40 !important;
+    }
+    /* Fix chevron toggle button: ml-auto + rotate-180 + py-4 shoved the arrow 1px against the left border */
+    .fixed.right-4.bottom-4 > [data-slot="accordion"] > [data-slot="accordion-item"] > .flex.justify-end [data-slot="accordion-trigger"] {
+      display: inline-flex !important;
+      flex: none !important;
+      width: 36px !important;
+      height: 36px !important;
+      padding: 0 !important;
+      align-items: center !important;
+      justify-content: center !important;
+      background-color: var(--background) !important;
+      box-shadow: 0 4px 12px rgb(0 0 0 / 0.28) !important;
+    }
+    .fixed.right-4.bottom-4 > [data-slot="accordion"] > [data-slot="accordion-item"] > .flex.justify-end [data-slot="accordion-trigger"] [data-slot="accordion-trigger-icon"] {
+      margin: 0 !important;
+    }
+    /* Align task list cleanly beneath toggle button without stray ml-2 or dead pb-4 bottom gap */
+    .fixed.right-4.bottom-4 > [data-slot="accordion"] > [data-slot="accordion-item"] > [data-slot="accordion-content"] > div {
+      margin-left: 0 !important;
+      padding-top: 8px !important;
+      padding-bottom: 0 !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] .w-80 {
+      width: 344px !important;
+      max-width: calc(100vw - 32px) !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-content"] > div {
+      padding-bottom: 0 !important;
+    }
+    /* Make floating task cards opaque & cleanly spaced so underlying buttons never bleed through */
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] {
+      background-color: var(--background) !important;
+      box-shadow: 0 6px 20px rgb(0 0 0 / 0.32) !important;
+      padding: 0 !important;
+      gap: 0 !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] > div:first-child {
+      padding: 10px 8px 8px 12px !important;
+      gap: 10px !important;
+      align-items: center !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] > div:first-child .flex.flex-col {
+      gap: 2px !important;
+      line-height: 1.3 !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] > div:first-child .text-xs {
+      font-variant-numeric: tabular-nums !important;
+      opacity: 0.78 !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] > div:first-child > div:last-child {
+      gap: 2px !important;
+      align-items: center !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="accordion-trigger"] > div:first-child > div:last-child [data-slot="button"] {
+      width: 32px !important;
+      height: 32px !important;
+    }
+    .fixed.right-4.bottom-4 [data-slot="accordion-content"] [data-slot="progress"] {
+      border-radius: 0 !important;
+      height: 3px !important;
+    }
+
+    /* /upload staging layout & spacing balance */
+    .wrapper > div.flex.flex-row.p-12 {
+      padding: 28px 32px !important;
+      gap: 24px !important;
+    }
+
+    /* File explorer table header/cell exact horizontal alignment (0px offset) */
+    table th[data-slot="table-head"]:first-child,
+    table td[data-slot="table-cell"]:first-child {
+      width: 40px !important;
+      padding-left: 12px !important;
+      padding-right: 4px !important;
+    }
+    table td[data-slot="table-cell"]:first-child svg {
+      display: block !important;
+      margin: 0 auto !important;
+    }
+    table th[data-slot="table-head"]:nth-child(2) button[data-slot="button"] {
+      margin-left: -8px !important;
+    }
+    table th[data-slot="table-head"]:nth-child(3) button[data-slot="button"].mr-8 {
+      margin-right: 24px !important;
+    }
+    table td[data-slot="table-cell"]:nth-child(3) {
+      font-variant-numeric: tabular-nums !important;
+    }
+
+    /* File explorer footer stats bar */
+    .wrapper > div > div:first-child > div.p-4 {
+      padding: 14px 16px !important;
+      gap: 20px !important;
+      align-items: center !important;
+    }
+    .wrapper > div > div:first-child > div.p-4 .flex-1.flex-col {
+      gap: 8px !important;
+    }
+    .wrapper > div > div:first-child > div.p-4 label {
+      font-variant-numeric: tabular-nums !important;
+    }
+
+    /* Right options panel: fix accordion py-4 clash, section spacing, date & password inputs */
+    .wrapper [data-slot="accordion-trigger"] {
+      padding-top: 0 !important;
+      padding-bottom: 0 !important;
+      align-items: center !important;
+    }
+    .wrapper .min-w-80 > label + .flex.flex-col {
+      padding-top: 8px !important;
+      gap: 10px !important;
+    }
+    .wrapper [data-slot="accordion-content"] > div {
+      padding-bottom: 4px !important;
+    }
+    .wrapper input[type="datetime-local"] {
+      padding-top: 0 !important;
+      padding-bottom: 0 !important;
+      align-items: center !important;
+      font-variant-numeric: tabular-nums !important;
+    }
+    .wrapper .relative > input[data-slot="input"]:has(+ button) {
+      padding-right: 42px !important;
+    }
+
+    /* Non-overlapping optimizer status badge centered in the top header bar */
+    #kio-optimizer-chip {
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 30;
+      display: inline-flex;
+      align-items: center;
+      height: 28px;
+      padding: 0 10px;
+      border-radius: 9999px;
+      border: 1px solid var(--border, rgba(148, 163, 184, 0.25));
+      background: var(--background, rgba(17, 17, 17, 0.85));
+      color: var(--foreground, #fff);
+      font: 500 11px/1 system-ui, sans-serif;
+      letter-spacing: 0.01em;
+      pointer-events: none;
+      opacity: 0.78;
+      white-space: nowrap;
+    }
+    @media (max-width: 900px) {
+      #kio-optimizer-chip {
+        display: none;
+      }
+    }
+  `;
+
+  function injectUiFixesAndChip() {
     if (!document.documentElement) return;
-    const chip = document.createElement('div');
-    chip.textContent = 'Kio: CPU & Memory Optimized';
-    chip.style.cssText =
-      'position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:4px 8px;border-radius:6px;' +
-      'background:rgba(17,17,17,.85);color:#fff;font:12px/1.4 system-ui,sans-serif;pointer-events:none;opacity:.75';
-    document.documentElement.appendChild(chip);
+    if (!document.getElementById('kio-ui-ux-fixes')) {
+      const style = document.createElement('style');
+      style.id = 'kio-ui-ux-fixes';
+      style.textContent = UI_FIX_CSS;
+      (document.head || document.documentElement).appendChild(style);
+      diag.uiFixesApplied = true;
+    }
+    if (!document.getElementById('kio-optimizer-chip')) {
+      const chip = document.createElement('div');
+      chip.id = 'kio-optimizer-chip';
+      chip.textContent = 'Kio: CPU & Memory Optimized';
+      document.documentElement.appendChild(chip);
+    }
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', showModeChip, { once: true });
+    document.addEventListener('DOMContentLoaded', injectUiFixesAndChip, { once: true });
   } else {
-    showModeChip();
+    injectUiFixesAndChip();
   }
 
   // 1) Disable Request.prototype.duplex so kio.ac uses native file-backed XMLHttpRequest.send(Blob)
