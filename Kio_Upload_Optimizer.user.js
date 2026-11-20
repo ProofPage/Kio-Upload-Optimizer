@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kio Upload Optimizer
 // @namespace    https://github.com/ProofPage/Kio-Upload-Optimizer
-// @version      5.6.0
+// @version      5.6.1
 // @description  Eliminates CPU, timer, stream-slicing, and encrypted-buffer memory leaks on kio.ac with zero extra RAM usage, plus desktop & mobile UI/UX alignment, spacing, and hydration-safe task-tray overlap fixes.
 // @author       Page
 // @match        https://kio.ac/*
@@ -22,7 +22,7 @@
   window.__kioUploadOptimizerLoaded = true;
 
   const diag = {
-    version: 'v5.6.0',
+    version: 'v5.6.1',
     throttledProgress: 0,
     postTaskSaved: 0,
     rafCapped: 0,
@@ -45,10 +45,10 @@
   }
 
   const UI_FIX_CSS = `
-    /* Floating task queue widget (bottom-right, desktop & mobile safe-area aware) */
+    /* Floating task queue widget (bottom-right, lifted cleanly above desktop /upload CTA button) */
     .fixed.right-4.bottom-4 {
       z-index: 40 !important;
-      bottom: calc(16px + env(safe-area-inset-bottom, 0px)) !important;
+      bottom: calc(var(--kio-tray-bottom, 16px) + env(safe-area-inset-bottom, 0px)) !important;
     }
     /* Fix chevron toggle button: ml-auto + rotate-180 + py-4 shoved the arrow 1px against the left border */
     .fixed.right-4.bottom-4 > [data-slot="accordion"] > [data-slot="accordion-item"] > .flex.justify-end [data-slot="accordion-trigger"] {
@@ -74,7 +74,7 @@
     .fixed.right-4.bottom-4 [data-slot="accordion-content"] .w-80 {
       width: clamp(368px, 26vw, 440px) !important;
       max-width: calc(100vw - 32px) !important;
-      max-height: min(40vh, 300px) !important;
+      max-height: min(35vh, 260px) !important;
       scrollbar-width: thin;
     }
     /* Nested sub-task accordion inside a Collection card */
@@ -133,7 +133,6 @@
       flex-shrink: 0 !important;
       overflow: hidden !important;
       gap: 12px !important;
-      padding-bottom: max(0px, calc(var(--kio-task-tray-h, 0px) - 8px)) !important;
     }
     .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child > .min-w-80 {
       min-width: 0 !important;
@@ -143,6 +142,7 @@
       overflow-y: auto !important;
       scrollbar-width: thin;
       padding-right: 2px;
+      margin-bottom: calc(var(--kio-tray-h, 0px) + var(--kio-tray-gap, 0px)) !important;
     }
     .wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child > div:last-child {
       flex-shrink: 0 !important;
@@ -249,26 +249,36 @@
     }
   `;
 
-  let trayResizeObs = null;
+  const DESKTOP_CTA_SELECTOR = '.wrapper > div.flex.flex-row.p-12:has(> div > .min-w-80) > div:last-child > div:last-child';
+
+  let layoutResizeObs = null;
   let trayMountObs = null;
   let observedTray = null;
+  let observedCta = null;
+  let observedWrapper = null;
+  let observedRouteHost = null;
   let trayObserverBound = false;
 
-  function watchTrayLifecycle() {
+  function watchLayoutLifecycle() {
     if (typeof MutationObserver !== 'function' || !document.body) return;
     if (!trayMountObs) {
       trayMountObs = new MutationObserver(() => {
-        if (observedTray && observedTray.isConnected) return;
         syncTaskTrayOffset();
       });
     }
     trayMountObs.disconnect();
     if (observedTray && observedTray.isConnected && observedTray.parentElement) {
-      // Zero-overhead mode: watch only shallow direct children of tray's parent and body,
-      // so DOM updates inside file lists/progress bars never wake MutationObserver.
+      // Zero-overhead mode: watch only shallow direct children of tray's parent, body,
+      // route host, and /upload wrapper so DOM updates inside file lists/progress bars never fire.
       trayMountObs.observe(observedTray.parentElement, { childList: true });
       if (observedTray.parentElement !== document.body) {
         trayMountObs.observe(document.body, { childList: true });
+      }
+      if (observedRouteHost && observedRouteHost.isConnected) {
+        trayMountObs.observe(observedRouteHost, { childList: true });
+      }
+      if (observedWrapper && observedWrapper.isConnected) {
+        trayMountObs.observe(observedWrapper, { childList: true });
       }
     } else {
       // Discovery/hydration mode: locate the live tray node, then immediately narrow scope.
@@ -277,30 +287,81 @@
   }
 
   function syncTaskTrayOffset() {
-    if (observedTray && !observedTray.isConnected) {
-      observedTray = null;
-    }
+    if (observedTray && !observedTray.isConnected) observedTray = null;
+    if (observedCta && !observedCta.isConnected) observedCta = null;
+    if (observedWrapper && !observedWrapper.isConnected) observedWrapper = null;
+    if (observedRouteHost && !observedRouteHost.isConnected) observedRouteHost = null;
+
     const tray = observedTray || document.querySelector('.fixed.right-4.bottom-4');
-    if (tray && tray !== observedTray && typeof ResizeObserver === 'function') {
-      if (trayResizeObs) trayResizeObs.disconnect();
-      observedTray = tray;
-      trayResizeObs = new ResizeObserver(syncTaskTrayOffset);
-      trayResizeObs.observe(tray);
-      watchTrayLifecycle();
-    } else if (!tray) {
-      watchTrayLifecycle();
+    const cta = document.querySelector(DESKTOP_CTA_SELECTOR);
+    const wrapper = document.querySelector('.wrapper');
+    const routeHost = (wrapper && wrapper.parentElement) || document.querySelector('main main > div');
+
+    let needRewatch = false;
+    if (wrapper !== observedWrapper) {
+      observedWrapper = wrapper;
+      needRewatch = true;
     }
+    if (routeHost !== observedRouteHost) {
+      observedRouteHost = routeHost;
+      needRewatch = true;
+    }
+
+    if ((tray !== observedTray || cta !== observedCta) && typeof ResizeObserver === 'function') {
+      if (layoutResizeObs) layoutResizeObs.disconnect();
+      observedTray = tray;
+      observedCta = cta;
+      if (tray || cta) {
+        layoutResizeObs = new ResizeObserver(syncTaskTrayOffset);
+        if (tray) layoutResizeObs.observe(tray);
+        if (cta) layoutResizeObs.observe(cta);
+      }
+      needRewatch = true;
+    } else if (!tray) {
+      needRewatch = true;
+    }
+
+    if (needRewatch) watchLayoutLifecycle();
+
+    const rootStyle = document.documentElement.style;
+
+    // On desktop /upload staging, keep the CTA ("업로드 & 링크 생성" + optional Turnstile) anchored at the bottom
+    // and lift the floating task tray cleanly 12px above the topmost visible CTA element.
+    let trayBottom = 16;
+    if (cta) {
+      let topMost = Infinity;
+      for (const child of cta.children) {
+        const cr = child.getBoundingClientRect();
+        if (cr.height > 0 && cr.width > 0 && cr.top < topMost) topMost = cr.top;
+      }
+      if (!Number.isFinite(topMost)) {
+        const ctaRect = cta.getBoundingClientRect();
+        if (ctaRect.height > 0 && ctaRect.width > 0) topMost = ctaRect.top;
+      }
+      if (Number.isFinite(topMost)) {
+        trayBottom = Math.max(16, Math.ceil(window.innerHeight - topMost + 12));
+      }
+    }
+    rootStyle.setProperty('--kio-tray-bottom', `${trayBottom}px`);
+
     if (!tray) {
-      document.documentElement.style.setProperty('--kio-task-tray-h', '0px');
+      rootStyle.setProperty('--kio-tray-h', '0px');
+      rootStyle.setProperty('--kio-tray-gap', '0px');
+      rootStyle.setProperty('--kio-task-tray-h', '0px');
       return;
     }
     const r = tray.getBoundingClientRect();
     if (r.height > 0 && r.width > 0) {
       const maxH = Math.floor(window.innerHeight * 0.65);
-      const trayH = Math.min(maxH, Math.max(0, Math.ceil(window.innerHeight - r.top)));
-      document.documentElement.style.setProperty('--kio-task-tray-h', `${trayH}px`);
+      const boxH = Math.min(maxH, Math.ceil(r.height));
+      const mobileClearance = Math.min(maxH, Math.max(0, Math.ceil(window.innerHeight - r.top)));
+      rootStyle.setProperty('--kio-tray-h', `${boxH}px`);
+      rootStyle.setProperty('--kio-tray-gap', '12px');
+      rootStyle.setProperty('--kio-task-tray-h', `${mobileClearance}px`);
     } else {
-      document.documentElement.style.setProperty('--kio-task-tray-h', '0px');
+      rootStyle.setProperty('--kio-tray-h', '0px');
+      rootStyle.setProperty('--kio-tray-gap', '0px');
+      rootStyle.setProperty('--kio-task-tray-h', '0px');
     }
   }
 
